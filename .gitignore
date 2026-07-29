@@ -1,0 +1,25 @@
+.venv/
+target/
+runs/
+output/
+submission/
+tmp/
+__pycache__/
+.pytest_cache/
+*.pyc
+/.secrets/
+.jj/
+doc/
+# Downloaded references and embedded upstream repositories are local-only.
+doc/sources/
+doc/repos/
+ref/
+tmp/
+
+# Local editor and background-process artifacts.
+/log.txt
+/nohup.out
+/scripts/test.py
+
+work/official_triton_agent/.git/
+work/official_triton_agent/set_env/set_api.sh
