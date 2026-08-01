@@ -1,0 +1,10 @@
+# Python dependencies installed on top of the HiDevLab Ascend image.
+# Keep torch, torch-npu, Triton-Ascend, CANN/msprof, and vLLM from the
+# selected image; installing their upstream PyPI builds can break NPU support.
+
+httpx>=0.27,<1
+langchain-core>=0.3,<2
+langchain-openai>=0.3,<2
+numpy>=1.26,<3
+packaging>=24,<27
+pytest>=8,<10
