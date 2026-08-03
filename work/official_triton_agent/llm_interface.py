@@ -15,9 +15,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from config import EAConfig
 
 
-# All possible model list (for validation)
+# Official Appendix 2 model IDs accepted by the competition runtime.
 ALL_AVAILABLE_MODELS = [
-    'deepseek-v4-pro', 'deepseek-v3.2', 'deepseek-r1',
+    'deepseek-v4-pro', 'deepseek-v3.2',
     'qwen3.5', 'qwen3.6',
     'kimi-k2-instruct',
     'glm-4.6'
@@ -34,6 +34,13 @@ class LLMInterface:
     """
 
     requires_prompt_brace_escaping = True
+
+    @staticmethod
+    def _require_allowed_model(model_name: str) -> None:
+        if model_name not in ALL_AVAILABLE_MODELS:
+            raise ValueError(
+                f"Model {model_name!r} is not in the official competition allowlist"
+            )
 
     def __init__(self, config: EAConfig, model_name: Optional[str] = None):
         """
@@ -59,24 +66,24 @@ class LLMInterface:
         self.call_count = 0
         self.call_history: List[Dict[str, Any]] = []
 
-        # Select model: prioritize passed-in, otherwise use first in list
-        if model_name:
-            self.current_model = model_name
-        elif config.llm_models:
-            self.current_model = config.llm_models[0]
-        else:
+        if not config.llm_models:
             raise ValueError("No available LLM, please add to config.llm_models")
+        for configured_model in config.llm_models:
+            self._require_allowed_model(configured_model)
 
-        # Validate model
-        if self.current_model not in ALL_AVAILABLE_MODELS:
-            print(f"Warning: Model {self.current_model} is not in the standard list, but will still try to use it")
+        # Select model: prioritize passed-in, otherwise use first in list
+        if model_name is not None:
+            self._require_allowed_model(model_name)
+            self.current_model = model_name
+        else:
+            self.current_model = config.llm_models[0]
 
         self._init_llm()
         print(f"[LLM] Initialization complete: {self.current_model}")
 
     def _init_llm(self):
         """Initialize LLM client"""
-        api_url = (self.config.api_url or os.getenv("API_URL", "https://api.siliconflow.cn/v1")).strip()
+        api_url = (self.config.api_url or os.getenv("API_URL", "https://api.deepseek.com/v1")).strip()
         api_key = self.config.api_key or os.getenv("API_KEY")
 
         if not api_key:
@@ -87,15 +94,15 @@ class LLMInterface:
         proxy_url = https_proxy or http_proxy
 
         if proxy_url:
-            print(f"[LLM] Using proxy: {proxy_url}")
+            print("[LLM] Using configured HTTP proxy")
 
         try:
-            client_kwargs = {"timeout": 60.0, "verify": False}
+            client_kwargs = {"timeout": 60.0}
             if proxy_url:
                 client_kwargs["proxy"] = proxy_url
             client = httpx.Client(**client_kwargs)
         except TypeError:
-            client_kwargs = {"timeout": 60.0, "verify": False}
+            client_kwargs = {"timeout": 60.0}
             if proxy_url:
                 client_kwargs["proxies"] = proxy_url
             client = httpx.Client(**client_kwargs)
@@ -117,6 +124,7 @@ class LLMInterface:
         Args:
             new_model: New model name
         """
+        self._require_allowed_model(new_model)
         if new_model != self.current_model:
             print(f"[LLM] Switching model: {self.current_model} -> {new_model}")
             self.current_model = new_model

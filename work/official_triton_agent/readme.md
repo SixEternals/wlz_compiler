@@ -223,9 +223,9 @@ ascendnpu-ir_1.0.0_linux-aarch64.run
 #解压并创建conda环境：
 TriTrans.tar.gz
 
-# 设置 API 密钥（SiliconFlow 或其他平台）
+# 设置 DeepSeek API 密钥
 export API_KEY="your-api-key"
-export API_URL="https://api.siliconflow.cn/v1"
+export API_URL="https://api.deepseek.com/v1"
 
 ```
 

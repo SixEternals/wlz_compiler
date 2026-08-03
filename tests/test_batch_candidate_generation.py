@@ -1390,7 +1390,7 @@ class BatchCandidateGenerationTests(unittest.TestCase):
                 return SimpleNamespace(
                     code="def op_a(x):\n    return x + 3\n",
                     id="child",
-                    generation=parent.generation + 1,
+                    generation=parent.generation,
                     metadata={"mutation_type": "param_tuning"},
                     model_used="child-model",
                 )

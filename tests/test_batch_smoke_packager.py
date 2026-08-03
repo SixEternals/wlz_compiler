@@ -116,7 +116,7 @@ class BatchSmokePackagerTests(unittest.TestCase):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self._write_operator(root, "op_a", None)
+            op_manifest = self._write_operator(root, "op_a", None)
             self._write_operator(
                 root,
                 "_per_group_transpose",
@@ -140,8 +140,22 @@ class BatchSmokePackagerTests(unittest.TestCase):
             )
             with zipfile.ZipFile(artifact) as archive:
                 names = archive.namelist()
+                self.assertIsNone(archive.testzip())
+                stats = json.loads(archive.read("output/op_a/op_a_stats.json"))
+            summary = stats["top5_summary"][0]
+            self.assertEqual(summary["code_hash"], sidecar["selections"][1]["candidate_sha256"])
+            self.assertEqual(summary["parent_ids"], [])
+            self.assertEqual(
+                summary["manifest_sha256"],
+                hashlib.sha256(op_manifest.read_bytes()).hexdigest(),
+            )
             self.assertEqual(sidecar["operator_count"], 2)
             self.assertEqual(sidecar["candidate_count"], 2)
+            self.assertEqual(
+                sidecar["scoring_intent"],
+                "mixed-local-admission-smoke-not-for-official-scoring",
+            )
+            self.assertFalse(sidecar["official_scoring_ready"])
             self.assertEqual(len(names), 6)
             self.assertIn("output/op_a/op_a_v1.py", names)
             self.assertIn(
@@ -158,6 +172,27 @@ class BatchSmokePackagerTests(unittest.TestCase):
                     "op_a": "static_import_only",
                 },
             )
+
+    def test_rejects_oversize_and_unsafe_archives(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_operator(root, "op_a", None)
+            selection = self._write_selection_lock(root, ["op_a"])
+            artifact = root / "oversize.zip"
+            with patch.object(module, "MAX_ARTIFACT_BYTES", 1):
+                with self.assertRaisesRegex(ValueError, "platform limit"):
+                    module.build_batch_smoke(
+                        root / "datasets", root / "candidates", artifact, selection
+                    )
+            self.assertFalse(artifact.exists())
+            self.assertFalse(artifact.with_suffix(".manifest.json").exists())
+
+            unsafe = root / "unsafe.zip"
+            with zipfile.ZipFile(unsafe, "w") as archive:
+                archive.writestr("../escape.py", "pass\n")
+            with self.assertRaisesRegex(ValueError, "Unsafe"):
+                module._verify_archive(unsafe, ["../escape.py"])
 
     def test_refuses_operator_without_static_pass_candidate(self) -> None:
         module = load_module()

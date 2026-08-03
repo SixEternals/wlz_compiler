@@ -79,6 +79,24 @@ def _has_b2_packaging_admission(kernel: str, candidate: dict, manifest: dict) ->
     )
 
 
+def _candidate_summary(candidate: dict, manifest_path: Path) -> dict:
+    parent_ids = candidate.get("parent_ids", [])
+    if not isinstance(parent_ids, list):
+        parent_ids = []
+    return {
+        "id": candidate.get("id"),
+        "code_hash": candidate.get("code_hash"),
+        "parent_ids": [item for item in parent_ids if isinstance(item, str)],
+        "generation": candidate.get("generation"),
+        "mutation_kind": candidate.get("mutation_kind"),
+        "model_used": candidate.get("model_used"),
+        "prompt_id": candidate.get("prompt_id"),
+        "status": candidate.get("status"),
+        "manifest_sha256": _sha256(manifest_path.read_bytes()),
+        "fitness": None,
+    }
+
+
 def build_agent_smoke(
     datasets_dir: Path,
     kernel: str,
@@ -141,12 +159,8 @@ def build_agent_smoke(
             else {"candidate_calls": [item[1].get("llm_stats", {}) for item in candidates]}
         ),
         "top5_summary": [
-            {
-                "id": candidate.get("id"),
-                "fitness": None,
-                "generation": candidate.get("generation"),
-            }
-            for candidate, _, _, _ in candidates
+            _candidate_summary(candidate, manifest_path)
+            for candidate, _, manifest_path, _ in candidates
         ],
     }
     stats_bytes = (json.dumps(stats, indent=2, sort_keys=True) + "\n").encode("utf-8")

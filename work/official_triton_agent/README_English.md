@@ -223,9 +223,9 @@ Source the corresponding set_env.sh as required
 # Extract and create conda environment:
 TriTrans.tar.gz
 
-# Set API key (SiliconFlow or other platform)
+# Set the DeepSeek API key
 export API_KEY="your-api-key"
-export API_URL="https://api.siliconflow.cn/v1"
+export API_URL="https://api.deepseek.com/v1"
 ```
 
 ### 2. Modify Configuration (config.py)

@@ -48,6 +48,7 @@ class LocalExecutor:
                 "launch_contract_rules=v1",
                 "triton_semantic_rules=v2",
                 "target_device_rules=v1",
+                "unused_triton_local_rules=v1",
             ]
         )
         return sha256_text(raw)[:16]
@@ -57,10 +58,12 @@ class LocalExecutor:
             context.baseline_file,
             context.required_functions,
         )
+        baseline_code = _read_baseline_code(context.baseline_file)
         checks = validate_static_structure(
             candidate.code,
             context.required_functions,
             expected_function_contracts,
+            baseline_code=baseline_code,
         )
         passed = (
             checks["syntax_ok"]
@@ -69,6 +72,7 @@ class LocalExecutor:
             and checks["launch_contract_ok"]
             and checks["triton_semantics_ok"]
             and checks["target_device_ok"]
+            and checks["unused_triton_locals_ok"]
         )
 
         error_type: Optional[str] = None
@@ -109,6 +113,14 @@ class LocalExecutor:
                 for item in errors
                 if isinstance(item, dict)
             ) or "Known-invalid Triton compile-time structure"
+        elif not checks["unused_triton_locals_ok"]:
+            error_type = "new_unused_triton_local"
+            errors = checks.get("new_unused_triton_locals", [])
+            error_message = "; ".join(
+                f"{item['name']} at {item['function']}:{item['line']}"
+                for item in errors
+                if isinstance(item, dict)
+            ) or "Candidate adds an unread Triton kernel local"
 
         proxy_score = compute_proxy_score(candidate, checks) if passed else 0.0
         metadata = dict(checks)
@@ -122,6 +134,7 @@ class LocalExecutor:
                     "signature_fail",
                     "launch_contract_fail",
                     "triton_semantic_fail",
+                    "new_unused_triton_local",
                     "compile_fail",
                     "correctness_fail",
                     "timeout",
@@ -157,6 +170,8 @@ def validate_static_structure(
     code: str,
     required_functions: List[str],
     expected_function_contracts: Optional[Dict[str, object]] = None,
+    *,
+    baseline_code: Optional[str] = None,
 ) -> Dict[str, object]:
     checks: Dict[str, object] = {
         "syntax_ok": False,
@@ -176,6 +191,8 @@ def validate_static_structure(
         "decorator_mismatches": {},
         "triton_semantic_errors": [],
         "target_device_errors": [],
+        "unused_triton_locals_ok": True,
+        "new_unused_triton_locals": [],
     }
 
     try:
@@ -220,6 +237,9 @@ def validate_static_structure(
     target_device_errors = _target_device_errors(tree)
     checks["target_device_errors"] = target_device_errors
     checks["target_device_ok"] = not target_device_errors
+    new_unused_locals = _new_unused_triton_locals(tree, aliases, baseline_code)
+    checks["new_unused_triton_locals"] = new_unused_locals
+    checks["unused_triton_locals_ok"] = not new_unused_locals
 
     if required_functions:
         missing = [name for name in required_functions if name not in functions]
@@ -379,6 +399,103 @@ def _assigned_names(node: ast.AST) -> List[str]:
         for item in ast.walk(node)
         if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store)
     ]
+
+
+def _read_baseline_code(baseline_file: Optional[Path]) -> Optional[str]:
+    if baseline_file is None or not baseline_file.is_file():
+        return None
+    try:
+        return baseline_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+
+def _new_unused_triton_locals(
+    candidate_tree: ast.Module,
+    candidate_aliases: Dict[str, str],
+    baseline_code: Optional[str],
+) -> List[Dict[str, object]]:
+    """Return candidate-only unread assignments in top-level Triton kernels.
+
+    This is deliberately a baseline-relative check: pre-existing unread locals
+    are tolerated, while a newly introduced unread assignment is rejected.
+    When the baseline is unavailable or unparsable, the check is disabled.
+    """
+
+    if baseline_code is None:
+        return []
+    try:
+        baseline_tree = ast.parse(baseline_code)
+    except SyntaxError:
+        return []
+
+    baseline_aliases = _import_aliases(baseline_tree)
+    baseline_unused = _unused_triton_assignment_keys(baseline_tree, baseline_aliases)
+    candidate_unused = _unused_triton_assignment_records(candidate_tree, candidate_aliases)
+    remaining = dict(baseline_unused)
+    new_locals: List[Dict[str, object]] = []
+    for record in candidate_unused:
+        key = record["key"]
+        count = remaining.get(key, 0)
+        if count:
+            remaining[key] = count - 1
+        else:
+            new_locals.append({name: value for name, value in record.items() if name != "key"})
+    return new_locals
+
+
+def _unused_triton_assignment_keys(tree: ast.Module, aliases: Dict[str, str]) -> Dict[tuple, int]:
+    counts: Dict[tuple, int] = {}
+    for record in _unused_triton_assignment_records(tree, aliases):
+        key = record["key"]
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _unused_triton_assignment_records(
+    tree: ast.Module, aliases: Dict[str, str]
+) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    for function in tree.body:
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not any(_is_triton_jit(_canonical_name(dec, aliases)) for dec in function.decorator_list):
+            continue
+
+        loaded_names = {
+            node.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        for assignment in ast.walk(function):
+            if isinstance(assignment, ast.AugAssign):
+                loaded_names.update(_assigned_names(assignment.target))
+                continue
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                continue
+            if isinstance(assignment, ast.AnnAssign) and assignment.value is None:
+                continue
+            targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+            target_names = [name for target in targets for name in _assigned_names(target)]
+            for name in target_names:
+                if name in loaded_names:
+                    continue
+                key = (
+                    function.name,
+                    name,
+                    ast.dump(assignment, annotate_fields=True, include_attributes=False),
+                )
+                records.append(
+                    {
+                        "code": "new_unused_triton_local",
+                        "function": function.name,
+                        "name": name,
+                        "line": getattr(assignment, "lineno", 0),
+                        "expression": ast.unparse(assignment),
+                        "key": key,
+                    }
+                )
+    return records
 
 
 def _load_expected_function_contracts(

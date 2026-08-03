@@ -177,34 +177,37 @@ def get_seed_codes(input_dir: Path, kernel_name: str) -> List[str]:
     return seed_codes
 
 
-def find_test_file(kernel_path: Path, kernel_name: str) -> Path:
-    """
-    Find test file
-
-    Priority:
-    1. test_{kernel_name}_1.py (test case 1)
-    2. test_{kernel_name}_2.py (test case 2)
-    3. test_{kernel_name}_3.py (test case 3)
-    4. test_{kernel_name}.py (without number)
-
-    Returns:
-        Test file path
-
-    Raises:
-        ValueError: No test file found
-    """
-    # Priority: find numbered test files (1, 2, 3)
+def find_test_files(kernel_path: Path, kernel_name: str) -> List[tuple[int, Path]]:
+    """Return all contiguous numbered cases, or one unnumbered case."""
+    prefix = f"test_{kernel_name}_"
+    unsupported = sorted(
+        path.name
+        for path in kernel_path.iterdir()
+        if path.is_file()
+        and path.name.startswith(prefix)
+        and path.suffix == ".py"
+        and path.stem[len(prefix):].isdigit()
+        and int(path.stem[len(prefix):]) not in range(1, 4)
+    )
+    if unsupported:
+        raise ValueError(f"Unsupported test case files for {kernel_name}: {unsupported}")
+    numbered = []
     for test_case_id in range(1, 4):
         test_file = kernel_path / f"test_{kernel_name}_{test_case_id}.py"
         if test_file.exists():
+            numbered.append((test_case_id, test_file))
+    if numbered:
+        case_ids = [case_id for case_id, _ in numbered]
+        if case_ids != list(range(1, case_ids[-1] + 1)):
+            raise ValueError(f"Non-contiguous test cases for {kernel_name}: {case_ids}")
+        for _, test_file in numbered:
             print(f"[Loader] Loading test code: {test_file.name}")
-            return test_file
+        return numbered
 
-    # Fallback to unnumbered test file
     test_file = kernel_path / f"test_{kernel_name}.py"
     if test_file.exists():
         print(f"[Loader] Loading test code: {test_file.name}")
-        return test_file
+        return [(1, test_file)]
 
     raise ValueError(
         f"No test file found for operator {kernel_name}. "
@@ -212,7 +215,9 @@ def find_test_file(kernel_path: Path, kernel_name: str) -> Path:
     )
 
 
-def load_kernel_code(kernel_path: Path, kernel_name: str) -> tuple[str, Path]:
+def load_kernel_code(
+    kernel_path: Path, kernel_name: str
+) -> tuple[str, List[tuple[int, Path]]]:
     """
     Load operator code and test file path
 
@@ -229,7 +234,7 @@ def load_kernel_code(kernel_path: Path, kernel_name: str) -> tuple[str, Path]:
         kernel_name: Operator name
 
     Returns:
-        (code, test_file_path): Main code and test file path
+        (code, test cases): Main code and ``(case id, test path)`` pairs
     """
     kernel_file = kernel_path / f"{kernel_name}.py"
 
@@ -240,10 +245,16 @@ def load_kernel_code(kernel_path: Path, kernel_name: str) -> tuple[str, Path]:
     with open(kernel_file, 'r', encoding='utf-8') as f:
         code = f.read()
 
-    # Find test file (return path, do not read content)
-    test_file = find_test_file(kernel_path, kernel_name)
+    return code, find_test_files(kernel_path, kernel_name)
 
-    return code, test_file
+
+def _functional_success(result: dict) -> bool:
+    """Return true only for an explicitly successful export candidate."""
+    top5 = result.get('top5_codes')
+    if not isinstance(top5, list) or not top5 or not isinstance(top5[0], dict):
+        return False
+    status = top5[0].get('evaluation_status')
+    return isinstance(status, dict) and status.get('success') is True
 
 
 def optimize_single_kernel(
@@ -273,8 +284,8 @@ def optimize_single_kernel(
         # Kernel-specific directory
         kernel_dir = input_dir / kernel_name
 
-        # Load main code and test file path
-        baseline_code, test_file = load_kernel_code(kernel_dir, kernel_name)
+        # Load main code and all available test cases
+        baseline_code, test_cases = load_kernel_code(kernel_dir, kernel_name)
 
         # Get all seed codes (including variants)
         seed_codes = get_seed_codes(input_dir, kernel_name)
@@ -282,10 +293,10 @@ def optimize_single_kernel(
         # Initialize Agent, pass test file path (not code content)
         agent = TritonOptimizerAgent(config)
         agent.setup(
-            baseline_code, 
-            str(test_file),  # Pass file path! Avoid setup writing temp files to data directory
+            baseline_code,
             kernel_name=kernel_name,
-            work_dir=str(kernel_dir)  # Pass kernel-specific directory
+            work_dir=str(kernel_dir),
+            test_cases=[(case_id, str(path)) for case_id, path in test_cases],
         )
 
         # Run optimization
@@ -296,12 +307,12 @@ def optimize_single_kernel(
         agent.save_results(str(kernel_output_dir), kernel_name)
 
         # Determine success
-        success = result['best_fitness'] > 0
+        success = _functional_success(result)
 
         if success:
             print(f"[Main] Optimization successful: {kernel_name} (fitness={result['best_fitness']:.4f})")
         else:
-            print(f"[Main] Optimization failed: {kernel_name} (did not pass functional test)")
+            print(f"[Main] Optimization failed: {kernel_name} (no explicitly successful candidate)")
 
         return success
 
@@ -363,7 +374,8 @@ def main():
     if not config.llm_models:
         print(f"\nError: No LLM configured!")
         print(f"Please add at least one model to the llm_models list in config.py")
-        print(f"Available models: deepseek-v4-pro, deepseek-v3.2, deepseek-r1, qwen3.5, qwen3.6, kimi-k2-instruct, glm-4.6, etc.")
+        print("Available models: deepseek-v4-pro, deepseek-v3.2, qwen3.5, "
+              "qwen3.6, kimi-k2-instruct, glm-4.6")
         sys.exit(1)
 
     print(f"\n[Main] Model evolution configuration:")
@@ -422,7 +434,7 @@ def main():
         print(f"  - {kernel_name}: {status}")
 
     # Return exit code
-    sys.exit(0 if success_count > 0 else 1)
+    sys.exit(0 if success_count == len(kernels) else 1)
 
 
 if __name__ == "__main__":

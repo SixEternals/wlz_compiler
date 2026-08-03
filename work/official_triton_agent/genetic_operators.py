@@ -44,7 +44,7 @@ PROMPT_CONTEXT_SUPPORTED_VERSIONS = frozenset({
     PROMPT_CONTEXT_SANITIZATION_VERSION,
 })
 MUTATION_PLAN_VERSION = "ascend-triton-mutation-plan-v1"
-MUTATION_PROMPT_VERSION = "ascend-triton-mutation-prompt-v2"
+MUTATION_PROMPT_VERSION = "ascend-triton-mutation-prompt-v4"
 PROMPT_CONTEXT_FAILURE_CATEGORIES = frozenset({
     "syntax_fail",
     "import_fail",
@@ -99,10 +99,14 @@ class MutationPlan:
 _MUTATION_SKILLS = {
     'param_tuning': SkillSpec(
         'param_tuning',
-        'ascend-triton-param-tuning-v1',
+        'ascend-triton-param-tuning-v3',
         (
         "Purpose: Tune general compile-time tile and launch choices without changing algorithm semantics.",
         "Allowed changes: Adjust general tile or launch settings such as BLOCK_SIZE, num_warps, and num_stages. Remove an optional launch keyword only when current evidence shows it is unsupported by Ascend.",
+        "Selection procedure: First inspect the parent source for existing tile constants, loop bounds, access patterns, and launch options; choose a source-derived tuning surface with a concrete expected effect.",
+        "Looped reduction rule: When a compile-time tile controls repeated passes over the same row, compare neighboring power-of-two tiles by expected pass count, masked lanes, reduction width, and resource pressure; do not assume a larger tile is faster.",
+        "Evidence rule: Do not add fixed num_warps or num_stages merely because values such as 4 or 2 are common. Change a launch option only when the parent structure or supplied evaluation evidence provides a concrete reason.",
+        "Negative evidence: If supplied evaluation evidence reports that a launch-only configuration was neutral or slower, do not reproduce it or an equivalent launch-only change; use a different authorized tuning surface.",
         "Required boundaries: Preserve the wrapper calling convention, runtime argument bindings, grid dimensionality, interface contract, and correctness for general inputs.",
         "Forbidden changes: Do not branch on or build lookup tables for exact observed shapes, values, function names, case IDs, or other benchmark fingerprints.",
         ),
@@ -116,10 +120,11 @@ _MUTATION_SKILLS = {
     ),
     'strategy_change': SkillSpec(
         'strategy_change',
-        'ascend-triton-strategy-change-v1',
+        'ascend-triton-strategy-change-v2',
         (
         "Purpose: Apply a general memory-access, work-partitioning, or parallelization strategy while preserving algorithm semantics.",
         "Allowed changes: Reorganize kernel dataflow, access order, work decomposition, or parallel execution when the transformation remains correct for general inputs.",
+        "Required effect: Materially change at least one authorized strategy surface in executable code. Reordering operands of a commutative expression, renaming locals, or changing only comments or diagnostics does not qualify as a strategy change.",
         "Required boundaries: Preserve the interface, wrapper calling convention, runtime argument bindings, and grid dimensionality. Keep tile and launch settings unless the selected strategy requires a compatible general adjustment.",
         "Forbidden changes: Do not replace the algorithm, specialize for benchmark fingerprints, or make a tile-only change under this Skill.",
         ),
@@ -628,6 +633,18 @@ def _ancestor_ids(individual: "Individual") -> list:
     )
 
 
+def _inherited_prompt_context(*individuals: "Individual"):
+    """Carry the most evaluated structured evidence into a new child."""
+    contexts = [
+        individual.metadata.get("prompt_context")
+        for individual in individuals
+        if isinstance(individual.metadata.get("prompt_context"), Mapping)
+    ]
+    if not contexts:
+        return None
+    return dict(max(contexts, key=lambda item: item.get("evaluation_count", 0)))
+
+
 class GeneticOperators:
     """
     [Student Implementation Area] Genetic Operators Implementation
@@ -709,9 +726,16 @@ class GeneticOperators:
 
         # Generation is assigned by the caller (evolve_generation); operators never
         # touch it, so a crossover+mutate child is not double-incremented.
+        metadata = {
+            'parents': [parent1.id, parent2.id],
+            'operation': 'crossover',
+        }
+        prompt_context = _inherited_prompt_context(parent1, parent2)
+        if prompt_context is not None:
+            metadata['prompt_context'] = prompt_context
         return Individual(
             code=new_code,
-            metadata={'parents': [parent1.id, parent2.id], 'operation': 'crossover'},
+            metadata=metadata,
             model_used=self.llm.current_model  # Record the model used
         )
 
@@ -789,6 +813,9 @@ class GeneticOperators:
             child_metadata['repair_guidance_sha256'] = hashlib.sha256(
                 repair_guidance.encode('utf-8')
             ).hexdigest()
+        prompt_context = _inherited_prompt_context(individual)
+        if prompt_context is not None:
+            child_metadata['prompt_context'] = prompt_context
 
         # Generation is assigned by the caller (evolve_generation); operators never
         # touch it, so a crossover+mutate child is not double-incremented.

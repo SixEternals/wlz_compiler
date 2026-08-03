@@ -17,6 +17,7 @@ Reference EvoPrompt algorithm workflow:
 
 import random
 import time
+from math import isfinite
 from typing import List, Tuple, Optional
 import numpy as np
 
@@ -79,6 +80,125 @@ class EvolutionaryAlgorithm:
             print("[EA] Token budget exhausted, stopping")
             return True
         return False
+
+    def _evaluation_timeout(self) -> float:
+        """Bound one executor call by the remaining wall-clock budget."""
+        timeout = float(self.config.timeout_seconds)
+        budget = getattr(self.genetic_ops.llm, "budget_controller", None)
+        if budget is not None:
+            remaining = float(budget.snapshot().remaining_seconds)
+        elif self._deadline is not None:
+            remaining = self._deadline - time.time()
+        else:
+            return timeout
+        return max(0.0, min(timeout, remaining))
+
+    @staticmethod
+    def _failure_category(result: EvaluationResult) -> Optional[str]:
+        """Map executor text to a bounded category without exposing raw logs."""
+        if result.success:
+            return None
+        text = str(result.error or "").lower()
+        markers = (
+            (("syntax",), "syntax_fail"),
+            (("import",), "import_fail"),
+            (("signature",), "signature_fail"),
+            (("launch contract",), "launch_contract_fail"),
+            (("triton", "semantic"), "triton_semantic_fail"),
+            (("accuracy", "correctness"), "accuracy_check_failed"),
+            (("timeout", "timed out"), "timeout"),
+            (("runtime",), "runtime_error"),
+        )
+        for needles, category in markers:
+            if any(needle in text for needle in needles):
+                return category
+        return "other"
+
+    @classmethod
+    def _prompt_context_for_result(cls, previous, result: EvaluationResult) -> dict:
+        """Extend only the typed evaluation facts consumed by mutation prompts."""
+        source = dict(previous) if isinstance(previous, dict) else {}
+
+        def count(name: str) -> int:
+            value = source.get(name, 0)
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+        evaluation_count = count("evaluation_count")
+
+        def triplet(name: str) -> list[int]:
+            value = source.get(name, (0, 0, evaluation_count))
+            if (
+                isinstance(value, (list, tuple))
+                and len(value) == 3
+                and all(isinstance(item, int) and not isinstance(item, bool) and item >= 0 for item in value)
+                and sum(value) == evaluation_count
+            ):
+                return list(value)
+            return [0, 0, evaluation_count]
+
+        compile_counts = triplet("compile_counts")
+        correctness_counts = triplet("correctness_counts")
+        category = cls._failure_category(result)
+        if result.success:
+            compile_counts[0] += 1
+            correctness_counts[0] += 1
+        else:
+            compile_failed = category in {
+                "syntax_fail",
+                "import_fail",
+                "signature_fail",
+                "launch_contract_fail",
+                "triton_semantic_fail",
+            }
+            correctness_failed = category == "accuracy_check_failed"
+            compile_counts[1 if compile_failed else 0] += 1
+            correctness_counts[1 if correctness_failed else 2] += 1
+
+        failures = {}
+        raw_failures = source.get("failure_category_counts", ())
+        if isinstance(raw_failures, (list, tuple)):
+            for item in raw_failures:
+                if (
+                    isinstance(item, (list, tuple))
+                    and len(item) == 2
+                    and item[0] in {
+                        "syntax_fail",
+                        "import_fail",
+                        "signature_fail",
+                        "launch_contract_fail",
+                        "triton_semantic_fail",
+                        "runtime_error",
+                        "accuracy_check_failed",
+                        "timeout",
+                        "other",
+                    }
+                    and isinstance(item[1], int)
+                    and not isinstance(item[1], bool)
+                    and item[1] > 0
+                ):
+                    failures[item[0]] = item[1]
+        if category is not None:
+            failures[category] = failures.get(category, 0) + 1
+
+        speedups = []
+        raw_speedups = source.get("observed_speedups", ())
+        if isinstance(raw_speedups, (list, tuple)):
+            for value in raw_speedups[-7:]:
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value):
+                    speedups.append(float(value))
+        speedup = getattr(result, "speedup", None)
+        if isinstance(speedup, (int, float)) and not isinstance(speedup, bool) and isfinite(speedup):
+            speedups.append(float(speedup))
+
+        return {
+            "sanitization_version": "prompt-context-sanitization-v2",
+            "evaluation_count": evaluation_count + 1,
+            "evaluation_pass_count": count("evaluation_pass_count") + int(result.success),
+            "compile_counts": compile_counts,
+            "correctness_counts": correctness_counts,
+            "failure_category_counts": sorted(failures.items()),
+            "observed_speedups": speedups[-8:],
+        }
 
     def initialize_population(self, seed_codes: List[str]) -> None:
         """
@@ -177,13 +297,16 @@ class EvolutionaryAlgorithm:
         better = parent1 if parent1.fitness >= parent2.fitness else parent2
 
         def clone_better() -> Individual:
+            metadata = {
+                'parent': better.id,
+                'operation': 'clone',
+                'lineage': _ancestor_ids(better),
+            }
+            if isinstance(better.metadata.get('prompt_context'), dict):
+                metadata['prompt_context'] = dict(better.metadata['prompt_context'])
             return Individual(
                 code=better.code,
-                metadata={
-                    'parent': better.id,
-                    'operation': 'clone',
-                    'lineage': _ancestor_ids(better),
-                },
+                metadata=metadata,
                 model_used=better.model_used,
             )
 
@@ -279,16 +402,26 @@ class EvolutionaryAlgorithm:
             if ind.fitness == 0 and not ind.metadata.get('evaluated', False):
                 if self._budget_exhausted():
                     break
+                timeout = self._evaluation_timeout()
+                if timeout <= 0:
+                    break
                 result: EvaluationResult = self.executor.evaluate(
-                    ind.code, timeout=self.config.timeout_seconds
+                    ind.code, timeout=timeout
                 )
+                evaluation_evidence = getattr(result, 'evidence', {})
+                if not isinstance(evaluation_evidence, dict):
+                    evaluation_evidence = {}
                 ind.fitness = result.fitness
                 ind.metadata.update({
                     'evaluated': True,
                     'success': result.success,
                     'speedup': result.speedup,
                     'execution_time': result.execution_time,
-                    'error': result.error
+                    'error': result.error,
+                    'evaluation_evidence': dict(evaluation_evidence),
+                    'prompt_context': self._prompt_context_for_result(
+                        ind.metadata.get('prompt_context'), result
+                    ),
                 })
 
     def run(self, seed_codes: List[str], deadline_seconds: Optional[float] = None) -> Individual:

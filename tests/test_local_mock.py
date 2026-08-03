@@ -32,6 +32,21 @@ class LocalExecutorTests(unittest.TestCase):
             metadata={},
         )
 
+    def _evaluate_with_baseline(self, baseline_code: str, candidate_code: str) -> EvaluationResult:
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline_file = Path(tmp) / "kernel.py"
+            baseline_file.write_text(baseline_code, encoding="utf-8")
+            return LocalExecutor().evaluate(
+                self._candidate(candidate_code),
+                EvalContext(
+                    op_name="demo_op",
+                    input_dir=Path(tmp),
+                    output_dir=Path(tmp),
+                    required_functions=["kernel"],
+                    baseline_file=baseline_file,
+                ),
+            )
+
     def test_valid_triton_static_code_passes(self) -> None:
         code = "\n".join(
             [
@@ -168,6 +183,74 @@ class LocalExecutorTests(unittest.TestCase):
         self.assertEqual(result.error_type, "launch_contract_fail")
         self.assertIn("kernel", result.metadata["decorator_mismatches"])
 
+    def test_candidate_new_unread_triton_local_is_rejected(self) -> None:
+        baseline_code = "\n".join(
+            [
+                "import triton",
+                "import triton.language as tl",
+                "",
+                "@triton.jit",
+                "def kernel(x):",
+                "    tl.store(x, 0)",
+                "",
+            ]
+        )
+        candidate_code = baseline_code.replace(
+            "    tl.store(x, 0)",
+            "    num_tokens = 16\n    tl.store(x, 0)",
+        )
+
+        result = self._evaluate_with_baseline(baseline_code, candidate_code)
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_type, "new_unused_triton_local")
+        self.assertEqual(
+            [item["name"] for item in result.metadata["new_unused_triton_locals"]],
+            ["num_tokens"],
+        )
+        self.assertIn("num_tokens at kernel", result.error_message)
+
+    def test_baseline_unread_triton_local_remains_allowed(self) -> None:
+        baseline_code = "\n".join(
+            [
+                "import triton",
+                "import triton.language as tl",
+                "",
+                "@triton.jit",
+                "def kernel(x):",
+                "    legacy_hint = 16",
+                "    tl.store(x, 0)",
+                "",
+            ]
+        )
+
+        result = self._evaluate_with_baseline(baseline_code, baseline_code)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.metadata["new_unused_triton_locals"], [])
+
+    def test_candidate_new_triton_local_is_allowed_when_read(self) -> None:
+        baseline_code = "\n".join(
+            [
+                "import triton",
+                "import triton.language as tl",
+                "",
+                "@triton.jit",
+                "def kernel(x):",
+                "    tl.store(x, 0)",
+                "",
+            ]
+        )
+        candidate_code = baseline_code.replace(
+            "    tl.store(x, 0)",
+            "    offset = 0\n    tl.store(x + offset, offset)",
+        )
+
+        result = self._evaluate_with_baseline(baseline_code, candidate_code)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.metadata["new_unused_triton_locals"], [])
+
     def test_runtime_dependent_arange_is_rejected(self) -> None:
         code = "\n".join(
             [
@@ -270,6 +353,8 @@ class LocalExecutorTests(unittest.TestCase):
             ROOT
             / "output/real-agent-candidates/_state_passing_fwd_kernel/d3ab8399.py"
         )
+        if not path.is_file():
+            self.skipTest("historical generated candidate is not available")
         code = path.read_text(encoding="utf-8")
         result = LocalExecutor().evaluate(
             self._candidate(code),

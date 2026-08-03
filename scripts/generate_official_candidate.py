@@ -137,6 +137,16 @@ def _manifest_path(path: Path) -> str:
         return str(resolved)
 
 
+def _find_duplicate_candidate(candidate_dir: Path, code_hash: str) -> str | None:
+    """Return the ID of an existing candidate with the same source bytes."""
+    if not candidate_dir.is_dir():
+        return None
+    for path in sorted(candidate_dir.glob("*.py")):
+        if sha256_text(path.read_text(encoding="utf-8")) == code_hash:
+            return path.stem
+    return None
+
+
 def _resolve_repair_guidance(
     manual_guidance: str | None,
     history_path: Path | None,
@@ -274,6 +284,8 @@ def generate_candidate(
     )
     try:
         child = operators.mutate(parent)
+        # Genetic operators are generation-agnostic; their caller owns this step.
+        child.generation = parent_generation + 1
         child.metadata["repair_attempt_count"] = prior_repair_attempts + int(
             bool(repair_guidance)
         )
@@ -304,6 +316,8 @@ def generate_candidate(
         # Preserve safe request provenance when mutation fails before a manifest exists.
         exc._wlz_llm_stats = llm.get_stats()
         raise
+    candidate_dir = output_dir / kernel
+    duplicate_id = _find_duplicate_candidate(candidate_dir, candidate_hash)
     rejection_error = None
     if candidate_hash in seed_hashes:
         rejection_error = "Generated candidate is byte-identical to an input seed"
@@ -311,6 +325,8 @@ def generate_candidate(
         rejection_error = "Generated candidate has no AST-level change from input seeds"
     elif candidate_hash == parent_hash:
         rejection_error = "Generated candidate is byte-identical to its parent"
+    elif duplicate_id is not None:
+        rejection_error = f"Generated candidate duplicates existing candidate: {duplicate_id}"
     else:
         contract_error = contract_module.interface_contract_error(
             operator_input.baseline_file.read_text(encoding="utf-8"), candidate_code
@@ -356,7 +372,6 @@ def generate_candidate(
                 f"{import_result.error_type}: {import_result.error_message}"
             )[:600]
 
-    candidate_dir = output_dir / kernel
     candidate_path = candidate_dir / f"{candidate.id}.py"
     manifest_path = candidate_dir / f"{candidate.id}.manifest.json"
     if candidate_path.exists() or manifest_path.exists():

@@ -11,13 +11,23 @@ import re
 import json
 import subprocess
 import csv
+import hashlib
+import importlib.metadata
+import io
+import math
+import platform
+import sys
 import tempfile
 import shutil
 from typing import Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import EAConfig
+
+
+MAX_PROFILE_CSV_BYTES = 4 * 1024 * 1024
+PROFILE_PARSER_RULE = "op-basic-info:first-exact-op-name:task-duration-us:v1"
 
 
 # Icon definitions
@@ -49,6 +59,7 @@ class EvaluationResult:
     speedup: float
     fitness: float
     error: Optional[str] = None
+    evidence: Dict[str, Any] = field(default_factory=dict)
 
 
 class TritonExecutor:
@@ -84,6 +95,7 @@ class TritonExecutor:
         self.work_dir = work_dir or Path(".")
         self.performance_dir = self.work_dir / "performance"
         self.performance_dir.mkdir(parents=True, exist_ok=True)
+        self._last_profile_observation: Dict[str, Any] = {}
 
         print(f"\n[{ICONS['rocket']}] [Executor] Initializing Triton executor...")
         print(f"       └─ Operator name: {kernel_name}")
@@ -104,35 +116,109 @@ class TritonExecutor:
         if not opprof_dirs:
             return None
 
-        return max(opprof_dirs, key=lambda d: d.stat().st_mtime)
+        if len(opprof_dirs) != 1:
+            return None
+        return opprof_dirs[0]
 
-    def _parse_op_basic_info(self, result_dir: Path) -> Optional[float]:
-        """
-        Parse OpBasicInfo.csv to get Task Duration
-        Return execution time (microseconds), return None on failure
-        """
+    @property
+    def last_profile_observation(self) -> Dict[str, Any]:
+        """Return a JSON-safe copy of the most recent successful parse."""
+        return json.loads(json.dumps(self._last_profile_observation))
+
+    @staticmethod
+    def _toolchain_fingerprint() -> Dict[str, Any]:
+        packages = {}
+        for package in ("torch", "torch-npu", "triton"):
+            try:
+                packages[package] = importlib.metadata.version(package)
+            except Exception:
+                # Package metadata is optional and must never invalidate timing.
+                packages[package] = None
+        facts = {
+            "python_version": platform.python_version(),
+            "machine": platform.machine(),
+            "system": platform.system(),
+            "release": platform.release(),
+            "packages": packages,
+        }
+        payload = json.dumps(
+            facts, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        return {"facts": facts, "sha256": hashlib.sha256(payload).hexdigest()}
+
+    def _relative_audit_path(self, path: Path) -> Optional[str]:
+        try:
+            relative = path.resolve(strict=True).relative_to(
+                self.work_dir.resolve(strict=True)
+            )
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if not relative.parts or ".." in relative.parts:
+            return None
+        return relative.as_posix()
+
+    def _read_profile_observation(self, result_dir: Path) -> Optional[Dict[str, Any]]:
+        """Read one bounded CSV snapshot and derive both timing and evidence."""
         opprof_dir = self._find_latest_opprof_dir(result_dir)
         if not opprof_dir:
             return None
 
         csv_path = opprof_dir / "OpBasicInfo.csv"
-        if not csv_path.exists():
+        csv_relative = self._relative_audit_path(csv_path)
+        if csv_relative is None:
+            return None
+        try:
+            if csv_path.stat().st_size > MAX_PROFILE_CSV_BYTES:
+                return None
+            csv_bytes = csv_path.read_bytes()
+            csv_text = csv_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
             return None
 
-        try:
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    try:
-                        duration = float(row.get('Task Duration(us)', 0))
-                        if duration > 0:
-                            return duration
-                    except (ValueError, KeyError):
-                        continue
-        except Exception:
-            pass
-
+        reader = csv.DictReader(io.StringIO(csv_text))
+        fieldnames = reader.fieldnames or []
+        if (
+            fieldnames.count("Op Name") != 1
+            or fieldnames.count("Task Duration(us)") != 1
+        ):
+            return None
+        for row_index, row in enumerate(reader, 1):
+            if row.get("Op Name") != self.kernel_name:
+                continue
+            try:
+                duration = float(row["Task Duration(us)"])
+            except (TypeError, ValueError, KeyError):
+                return None
+            if not math.isfinite(duration) or duration <= 0:
+                return None
+            return {
+                "schema_version": 1,
+                "kind": "msprof-op-observation",
+                "path_base": "executor_work_dir",
+                "run_directory_id": result_dir.name,
+                "csv_path": csv_relative,
+                "csv_sha256": hashlib.sha256(csv_bytes).hexdigest(),
+                "parser_rule": PROFILE_PARSER_RULE,
+                "parse_status": "parsed",
+                "kernel_name": self.kernel_name,
+                "target_row_index": row_index,
+                "execution_time_us": duration,
+                "toolchain_fingerprint": self._toolchain_fingerprint(),
+            }
         return None
+
+    def _parse_op_basic_info(self, result_dir: Path) -> Optional[float]:
+        """
+        Parse the first exact target-kernel Task Duration from OpBasicInfo.csv.
+
+        The organizer baseline contains one duration per test case and was
+        produced with first-record semantics. Keep that comparison contract,
+        but never score an unrelated op or silently skip a corrupt target row.
+        Return execution time (microseconds), return None on failure
+        """
+        observation = self._read_profile_observation(result_dir)
+        self._last_profile_observation = observation or {}
+        return observation["execution_time_us"] if observation is not None else None
 
     def _run_msprof(self, test_file: Path, timeout: int = 300) -> Optional[float]:
         """
@@ -141,29 +227,32 @@ class TritonExecutor:
         Returns:
             Execution time (microseconds), return None on failure
         """
-        result_dir = self.performance_dir / self.kernel_name
-        result_dir.mkdir(parents=True, exist_ok=True)
+        kernel_performance_dir = self.performance_dir / self.kernel_name
+        kernel_performance_dir.mkdir(parents=True, exist_ok=True)
+        result_dir = Path(tempfile.mkdtemp(prefix="run-", dir=kernel_performance_dir))
+        self._last_profile_observation = {}
 
         test_script_abs = str(test_file.resolve())
 
-        # Build msprof command
-        cmd_str = (
-            f'msprof op '
-            f'--output={result_dir} '
-            f'--application="python3 {test_script_abs}" '
-            f'--kernel-name="{self.kernel_name}" '
-            f'--aic-metrics=MemoryDetail,Occupancy,PipeUtilization,Roofline'
-        )
+        # Keep each run's output isolated and avoid shell parsing of paths.
+        cmd = [
+            "msprof",
+            "op",
+            f"--output={result_dir}",
+            f"--application={sys.executable} {test_script_abs}",
+            f"--kernel-name={self.kernel_name}",
+            "--aic-metrics=MemoryDetail,Occupancy,PipeUtilization,Roofline",
+        ]
 
-        print(cmd_str)
+        print(" ".join(cmd))
 
         log_file = result_dir / "get_prof.log"
 
         try:
             with open(log_file, 'w') as f:
                 result = subprocess.run(
-                    cmd_str,
-                    shell=True,
+                    cmd,
+                    shell=False,
                     stdout=f,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -282,5 +371,6 @@ class TritonExecutor:
             execution_time=current_time,
             speedup=speedup,
             fitness=fitness,
-            error=None
+            error=None,
+            evidence={"profile": self.last_profile_observation},
         )

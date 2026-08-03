@@ -10,7 +10,7 @@ import re
 import sys
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -38,6 +38,23 @@ _CORRECTNESS_ADMISSION_OPERATORS = frozenset(
 )
 _CANDIDATE_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+MAX_ARTIFACT_BYTES = 20_971_520
+
+
+def _verify_archive(output_zip: Path, expected_entries: list[str]) -> None:
+    if output_zip.stat().st_size > MAX_ARTIFACT_BYTES:
+        raise ValueError(f"Artifact exceeds platform limit of {MAX_ARTIFACT_BYTES} bytes")
+    with zipfile.ZipFile(output_zip) as archive:
+        names = archive.namelist()
+        bad_entry = archive.testzip()
+    if bad_entry is not None:
+        raise ValueError(f"Artifact ZIP integrity check failed at {bad_entry}")
+    if names != expected_entries:
+        raise ValueError("Artifact ZIP entries do not match the staged output")
+    for name in names:
+        path = PurePosixPath(name)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"Unsafe artifact ZIP entry: {name}")
 
 
 def _has_packaging_admission(operator: str, manifest: dict, candidate_id: str) -> bool:
@@ -166,7 +183,10 @@ def _select_candidate(
     return candidate_path, manifest_path, manifest
 
 
-def _stats_bytes(candidate: dict, manifest: dict) -> bytes:
+def _stats_bytes(candidate: dict, manifest: dict, manifest_path: Path) -> bytes:
+    parent_ids = candidate.get("parent_ids", [])
+    if not isinstance(parent_ids, list):
+        parent_ids = []
     stats = {
         "schema_version": 1,
         "evaluation_status": "not_evaluated_on_ascend",
@@ -178,8 +198,15 @@ def _stats_bytes(candidate: dict, manifest: dict) -> bytes:
         "top5_summary": [
             {
                 "id": candidate.get("id"),
+                "code_hash": candidate.get("code_hash"),
+                "parent_ids": [item for item in parent_ids if isinstance(item, str)],
                 "fitness": None,
                 "generation": candidate.get("generation"),
+                "mutation_kind": candidate.get("mutation_kind"),
+                "model_used": candidate.get("model_used"),
+                "prompt_id": candidate.get("prompt_id"),
+                "status": candidate.get("status"),
+                "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
             }
         ],
     }
@@ -286,7 +313,9 @@ def build_batch_smoke(
             relative_entries = {
                 output_root / f"{operator}_best.py": candidate_bytes,
                 output_root / f"{operator}_v1.py": candidate_bytes,
-                output_root / f"{operator}_stats.json": _stats_bytes(candidate, manifest),
+                output_root / f"{operator}_stats.json": _stats_bytes(
+                    candidate, manifest, manifest_path
+                ),
             }
             for relative, data in relative_entries.items():
                 entries[relative] = data
@@ -325,6 +354,12 @@ def build_batch_smoke(
                 info.external_attr = 0o100644 << 16
                 archive.writestr(info, data)
 
+    expected_entries = [str(path) for path in sorted(entries, key=str)]
+    try:
+        _verify_archive(output_zip, expected_entries)
+    except (OSError, zipfile.BadZipFile, ValueError):
+        output_zip.unlink(missing_ok=True)
+        raise
     artifact_bytes = output_zip.read_bytes()
     sidecar = {
         "schema_version": 1,
@@ -336,13 +371,14 @@ def build_batch_smoke(
         "scoring_intent": (
             "historical-composition-reproduction-not-for-submission"
             if historical_source is not None
-            else "21-operator-functional-and-performance-smoke"
+            else "mixed-local-admission-smoke-not-for-official-scoring"
         ),
+        "official_scoring_ready": False,
         "layout": "organizer-save-results-v1",
         "operator_count": len(operators),
         "candidate_count": len(selections),
         "selections": selections,
-        "archive_entries": [str(path) for path in sorted(entries, key=str)],
+        "archive_entries": expected_entries,
         "artifact_path": output_zip.name,
         "artifact_size": len(artifact_bytes),
         "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),

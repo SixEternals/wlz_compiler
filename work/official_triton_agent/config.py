@@ -11,6 +11,7 @@ Students configure all parameters by modifying this file, including:
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, List
 
 
@@ -54,7 +55,9 @@ class EAConfig:
     model_switch_prob: float = 0.2         # Probability of switching model during mutation
 
     # ==================== Evaluation Parameters ====================
-    baseline_json: str = "./baseline/baseline.json"  # Baseline data JSON file path
+    baseline_json: str = field(
+        default_factory=lambda: str(Path(__file__).resolve().parent / "baseline" / "baseline.json")
+    )  # Baseline data JSON file path
     timeout_seconds: int = 300             # Compilation/execution timeout
     max_iterations: int = 5                # Max fix attempts per operator
 

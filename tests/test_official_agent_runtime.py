@@ -1,6 +1,9 @@
 """Runtime behavior tests for work/official_triton_agent (no network, fake LLM/executor)."""
 
 import importlib.util
+import hashlib
+import json
+import os
 import sys
 import tempfile
 import time
@@ -95,12 +98,28 @@ def load_optimizer_agent():
             "config": _stub("config", EAConfig=dummy("EAConfig")),
             "llm_interface": _stub("llm_interface", LLMInterface=dummy("LLMInterface")),
             "contract_executor": _stub(
-                "contract_executor", ContractCheckingExecutor=dummy("ContractCheckingExecutor")
+                "contract_executor",
+                ContractCheckingExecutor=dummy("ContractCheckingExecutor"),
+                MultiCaseContractExecutor=dummy("MultiCaseContractExecutor"),
             ),
             "executor": _stub("executor", TritonExecutor=dummy("TritonExecutor")),
             "genetic_operators": _stub("genetic_operators", GeneticOperators=dummy("GeneticOperators")),
             "evolutionary_algorithm": _stub(
                 "evolutionary_algorithm", EvolutionaryAlgorithm=dummy("EvolutionaryAlgorithm")
+            ),
+        },
+    )
+
+
+def load_main():
+    return _load_module(
+        "official_runtime_main",
+        "main.py",
+        {
+            "config": _stub("config", EAConfig=type("EAConfig", (), {})),
+            "optimizer_agent": _stub(
+                "optimizer_agent",
+                TritonOptimizerAgent=type("TritonOptimizerAgent", (), {}),
             ),
         },
     )
@@ -233,6 +252,27 @@ class BudgetEnforcementTests(unittest.TestCase):
         self.assertEqual(ea.generation, 1)
         self.assertTrue(executor.timeouts)
         self.assertTrue(all(t == 123 for t in executor.timeouts))
+
+    def test_evaluation_timeout_is_capped_by_shared_wall_budget(self):
+        now = [0.0]
+        budget = BudgetController(
+            BudgetLimits(100, 300), clock=lambda: now[0]
+        )
+        now[0] = 299.0
+        genetic_ops = FakeGeneticOps()
+        genetic_ops.llm.budget_controller = budget
+        genetic_ops.llm.budget_denial_reason = None
+        executor = FakeExecutor()
+        ea = self.ea_module.EvolutionaryAlgorithm(
+            genetic_ops,
+            executor,
+            make_config(population_size=1, timeout_seconds=123),
+        )
+        ea.population = [Individual(code="seed code")]
+
+        ea._evaluate_population()
+
+        self.assertEqual(executor.timeouts, [1.0])
 
     def test_evolve_stops_breeding_when_token_budget_is_exhausted(self):
         genetic_ops = FakeGeneticOps(tokens_used=100)
@@ -448,6 +488,77 @@ class RobustnessTests(unittest.TestCase):
             self.assertIn(ind.code, ("strong", "weak"))
 
 
+class PromptFeedbackTests(unittest.TestCase):
+    def test_failure_context_reaches_next_mutation_and_is_inherited(self):
+        ea_module = load_evolutionary_algorithm()
+
+        class FailingExecutor:
+            def evaluate(self, code, timeout=None):
+                return SimpleNamespace(
+                    fitness=0.0,
+                    success=False,
+                    speedup=0.0,
+                    execution_time=0.0,
+                    error="runtime error",
+                )
+
+        class RecordingGeneticOps(FakeGeneticOps):
+            def __init__(self):
+                super().__init__()
+                self.seen_contexts = []
+
+            def mutate(self, individual):
+                context = individual.metadata.get("prompt_context")
+                self.seen_contexts.append(context)
+                child = super().mutate(individual)
+                if context is not None:
+                    child.metadata["prompt_context"] = dict(context)
+                return child
+
+        genetic_ops = RecordingGeneticOps()
+        ea = ea_module.EvolutionaryAlgorithm(
+            genetic_ops,
+            FailingExecutor(),
+            make_config(
+                population_size=1,
+                max_generations=1,
+                mutation_rate=1.0,
+            ),
+        )
+        ea.run(["seed code"])
+
+        self.assertEqual(len(genetic_ops.seen_contexts), 1)
+        self.assertEqual(
+            dict(genetic_ops.seen_contexts[0]["failure_category_counts"]),
+            {"runtime_error": 1},
+        )
+        self.assertEqual(genetic_ops.seen_contexts[0]["evaluation_count"], 1)
+
+        class CapturingLlm:
+            current_model = "deepseek-v4-pro"
+            requires_prompt_brace_escaping = False
+
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, prompt, **kwargs):
+                self.calls.append({"prompt": prompt, **kwargs})
+                return "def kernel(x):\n    return x\n"
+
+        llm = CapturingLlm()
+        operators = GENETIC_OPS.GeneticOperators(
+            llm, SimpleNamespace(llm_models=[llm.current_model])
+        )
+        parent = Individual(
+            code="def kernel(x):\n    return x\n",
+            metadata={"prompt_context": genetic_ops.seen_contexts[0]},
+        )
+        child = operators.mutate(parent)
+
+        self.assertEqual(child.metadata["prompt_context"], parent.metadata["prompt_context"])
+        self.assertIn("Failure Category Counts: runtime_error=1", llm.calls[0]["prompt"])
+
+
 class EvolutionSemanticsTests(unittest.TestCase):
     def setUp(self):
         self.ea_module = load_evolutionary_algorithm()
@@ -528,6 +639,85 @@ class ConfigDefaultsTests(unittest.TestCase):
         module = _load_module("official_runtime_config", "config.py", {})
         self.assertEqual(module.EAConfig().population_size, 10)
 
+    def test_default_baseline_path_is_anchored_to_agent_directory(self):
+        module = _load_module("official_runtime_config_path", "config.py", {})
+        expected = AGENT_DIR / "baseline" / "baseline.json"
+        previous = Path.cwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.chdir(tmp)
+                config = module.EAConfig()
+            finally:
+                os.chdir(previous)
+        self.assertEqual(Path(config.baseline_json), expected)
+        self.assertTrue(Path(config.baseline_json).is_file())
+
+
+class MainResultSemanticsTests(unittest.TestCase):
+    def test_functional_success_is_independent_of_zero_fitness(self):
+        module = load_main()
+        result = {
+            "best_fitness": 0.0,
+            "top5_codes": [{"evaluation_status": {"success": True}}],
+        }
+
+        self.assertTrue(module._functional_success(result))
+
+    def test_functional_success_fails_closed_without_explicit_success(self):
+        module = load_main()
+        for result in (
+            {"best_fitness": 1.0, "top5_codes": []},
+            {"best_fitness": 1.0, "top5_codes": [{}]},
+            {
+                "best_fitness": 1.0,
+                "top5_codes": [{"evaluation_status": {"success": False}}],
+            },
+        ):
+            with self.subTest(result=result):
+                self.assertFalse(module._functional_success(result))
+
+    def test_batch_exit_requires_every_kernel_to_succeed(self):
+        module = load_main()
+
+        class Config:
+            debug = False
+            llm_models = ["deepseek-v4-pro"]
+            model_switch_prob = 0.2
+
+            @staticmethod
+            def print_config():
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "input"
+            for kernel in ("op_a", "op_b"):
+                kernel_dir = input_dir / kernel
+                kernel_dir.mkdir(parents=True)
+                (kernel_dir / f"{kernel}.py").write_text("x = 1\n", encoding="utf-8")
+            args = SimpleNamespace(
+                debug=False,
+                input_dir=str(input_dir),
+                output_dir=str(root / "output"),
+                population_size=None,
+                max_generations=None,
+                kernel=None,
+            )
+
+            for outcomes, expected_code in (([True, True], 0), ([True, False], 1)):
+                with self.subTest(outcomes=outcomes):
+                    with (
+                        patch.object(module, "parse_args", return_value=args),
+                        patch.object(module, "EAConfig", return_value=Config()),
+                        patch.object(
+                            module, "optimize_single_kernel", side_effect=outcomes
+                        ),
+                        patch("builtins.print"),
+                        self.assertRaises(SystemExit) as raised,
+                    ):
+                        module.main()
+                    self.assertEqual(raised.exception.code, expected_code)
+
 
 class TopKTests(unittest.TestCase):
     def test_top_k_dedupes_and_excludes_baseline(self):
@@ -536,16 +726,62 @@ class TopKTests(unittest.TestCase):
         agent._baseline_code = "baseline"
         agent.ea = SimpleNamespace(
             population=[
-                SimpleNamespace(code="opt1", fitness=1.5),
-                SimpleNamespace(code="baseline", fitness=1.4),
-                SimpleNamespace(code="opt1\n", fitness=1.3),
-                SimpleNamespace(code="opt2", fitness=1.2),
-                SimpleNamespace(code=" baseline ", fitness=1.1),
-                SimpleNamespace(code="opt2", fitness=1.0),
+                SimpleNamespace(code="opt1", fitness=1.5, metadata={"success": True}),
+                SimpleNamespace(code="baseline", fitness=1.4, metadata={"success": True}),
+                SimpleNamespace(code="opt1\n", fitness=1.3, metadata={"success": True}),
+                SimpleNamespace(code="opt2", fitness=1.2, metadata={"success": True}),
+                SimpleNamespace(code=" baseline ", fitness=1.1, metadata={"success": True}),
+                SimpleNamespace(code="opt2", fitness=1.0, metadata={"success": True}),
             ]
         )
         top = agent._get_top_k(5)
         self.assertEqual([ind.code for ind in top], ["opt1", "opt2"])
+
+    def test_top_k_excludes_failures_but_keeps_successful_zero_fitness(self):
+        module = load_optimizer_agent()
+        agent = module.TritonOptimizerAgent.__new__(module.TritonOptimizerAgent)
+        agent._baseline_code = "baseline"
+        agent.ea = SimpleNamespace(
+            population=[
+                SimpleNamespace(
+                    code="failed", fitness=2.0, metadata={"success": False}
+                ),
+                SimpleNamespace(code="unknown", fitness=1.0, metadata={}),
+                SimpleNamespace(
+                    code="zero", fitness=0.0, metadata={"success": True}
+                ),
+            ]
+        )
+
+        top = agent._get_top_k(5)
+
+        self.assertEqual([ind.code for ind in top], ["zero"])
+
+    def test_optimize_reports_first_exportable_candidate_as_best(self):
+        module = load_optimizer_agent()
+        agent = module.TritonOptimizerAgent.__new__(module.TritonOptimizerAgent)
+        failed = SimpleNamespace(
+            code="failed", fitness=1.0, metadata={"success": False}, id="bad"
+        )
+        zero = SimpleNamespace(
+            code="zero",
+            fitness=0.0,
+            metadata={"success": True, "speedup": 0.0},
+            id="good",
+        )
+        agent.ea = SimpleNamespace(
+            run=lambda seeds, deadline_seconds=None: failed,
+            generation=1,
+            population=[failed, zero],
+        )
+        agent.llm = SimpleNamespace(get_stats=lambda: {"call_count": 0})
+        agent.optimization_history = []
+
+        result = agent.optimize(["baseline"], max_time=1)
+
+        self.assertEqual(result["best_code"], "zero")
+        self.assertEqual(result["best_provenance"]["id"], "good")
+        self.assertEqual(result["top5_codes"][0]["code"], "zero")
 
     def test_optimize_passes_max_time_as_deadline(self):
         module = load_optimizer_agent()
@@ -563,6 +799,266 @@ class TopKTests(unittest.TestCase):
         result = agent.optimize(["baseline"], max_time=42)
         self.assertEqual(run_kwargs["deadline_seconds"], 42)
         self.assertEqual(result["best_code"], "best")
+
+
+class ProvenanceTests(unittest.TestCase):
+    @staticmethod
+    def _case_evidence():
+        facts = {
+            "python_version": "3.11.15",
+            "machine": "aarch64",
+            "system": "Linux",
+            "release": "test",
+            "packages": {
+                "torch": "2.7.1",
+                "torch-npu": "2.7.1.post4",
+                "triton": "3.2.0",
+            },
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                facts, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "schema_version": 2,
+            "kind": "multi-case-real-evaluation",
+            "official_aggregate": False,
+            "aggregation": {
+                "execution_time_us": "sum-completed-case-time-v1",
+                "speedup": "minimum-successful-case-speedup-v1",
+                "fitness": "minimum-successful-case-fitness-v1",
+            },
+            "case_results": [
+                {
+                    "case_id": case_id,
+                    "status": "passed",
+                    "success": True,
+                    "baseline_time_us": execution_time * (1.0 + speedup),
+                    "execution_time_us": execution_time,
+                    "speedup": speedup,
+                    "fitness": fitness,
+                    "test_file": f"test_kernel_{case_id}.py",
+                    "test_sha256": "a" * 64,
+                    "baseline_code_sha256": "b" * 64,
+                    "profile": {
+                        "schema_version": 1,
+                        "kind": "msprof-op-observation",
+                        "path_base": "executor_work_dir",
+                        "run_directory_id": f"run-case-{case_id}",
+                        "csv_path": (
+                            f"performance/kernel/run-case-{case_id}/"
+                            f"OPPROF_case_{case_id}/OpBasicInfo.csv"
+                        ),
+                        "csv_sha256": "c" * 64,
+                        "parser_rule": (
+                            "op-basic-info:first-exact-op-name:"
+                            "task-duration-us:v1"
+                        ),
+                        "parse_status": "parsed",
+                        "kernel_name": "kernel",
+                        "target_row_index": 1,
+                        "execution_time_us": execution_time,
+                        "toolchain_fingerprint": {
+                            "facts": facts,
+                            "sha256": fingerprint,
+                        },
+                    },
+                }
+                for case_id, execution_time, speedup, fitness in (
+                    (1, 5.0, 0.5, 0.5),
+                    (2, 7.5, 0.4, 0.4),
+                )
+            ],
+        }
+
+    def test_optimize_and_save_results_preserve_candidate_provenance(self):
+        module = load_optimizer_agent()
+        agent = module.TritonOptimizerAgent.__new__(module.TritonOptimizerAgent)
+        case_evidence = self._case_evidence()
+        candidate = Individual(
+            code="candidate code",
+            fitness=0.4,
+            generation=2,
+            id="candidate-1",
+            model_used="deepseek-v4-pro",
+            metadata={
+                "parent": "parent-1",
+                "lineage": ["seed-1"],
+                "operation": "mutation",
+                "mutation_type": "local_rewrite",
+                "prompt_id": "prompt-1",
+                "evaluated": True,
+                "success": True,
+                "speedup": 0.4,
+                "execution_time": 12.5,
+                "evaluation_evidence": case_evidence,
+                "error": "private raw error must not be serialized",
+                "prompt_context": {
+                    "failure_category_counts": [("runtime_error", 1)],
+                },
+            },
+        )
+        agent._baseline_code = "baseline"
+        agent.ea = SimpleNamespace(
+            population=[candidate],
+            generation=2,
+            run=lambda seeds, deadline_seconds=None: candidate,
+        )
+        agent.llm = SimpleNamespace(get_stats=lambda: {"call_count": 1})
+        agent.budget = None
+        agent._budget_run_started = False
+        agent.optimization_history = []
+
+        result = agent.optimize(["baseline"], max_time=1)
+        item = result["top5_codes"][0]
+        self.assertEqual(item["id"], "candidate-1")
+        self.assertEqual(len(item["code_hash"]), 64)
+        self.assertEqual(item["parent_ids"], ["parent-1"])
+        self.assertEqual(item["lineage"], ["seed-1"])
+        self.assertEqual(item["mutation_kind"], "local_rewrite")
+        self.assertEqual(item["model_used"], "deepseek-v4-pro")
+        self.assertEqual(item["evaluation_status"]["success"], True)
+        self.assertEqual(item["evaluation_evidence"], case_evidence)
+        self.assertNotIn("error", item)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent.save_results(tmp, "demo")
+            stats = json.loads((Path(tmp) / "demo_stats.json").read_text(encoding="utf-8"))
+        saved = stats["top5_summary"][0]
+        self.assertEqual(saved["code_hash"], item["code_hash"])
+        self.assertEqual(saved["parent_ids"], ["parent-1"])
+        self.assertEqual(saved["evaluation_evidence"], case_evidence)
+        self.assertNotIn("private raw error", json.dumps(stats))
+
+    def test_candidate_provenance_accepts_single_case_v2_and_legacy_v1(self):
+        module = load_optimizer_agent()
+        evidence = self._case_evidence()
+        evidence["case_results"] = evidence["case_results"][:1]
+        individual = SimpleNamespace(
+            code="candidate",
+            fitness=0.5,
+            generation=1,
+            id="candidate",
+            model_used="deepseek-v4-pro",
+            metadata={
+                "evaluated": True,
+                "success": True,
+                "speedup": 0.5,
+                "execution_time": 5.0,
+                "evaluation_evidence": evidence,
+            },
+        )
+        provenance = module.TritonOptimizerAgent._candidate_provenance(individual)
+        self.assertEqual(provenance["evaluation_evidence"], evidence)
+
+        legacy = self._case_evidence()
+        legacy["schema_version"] = 1
+        for case in legacy["case_results"]:
+            case.pop("profile")
+        individual.fitness = 0.4
+        individual.metadata.update({
+            "speedup": 0.4,
+            "execution_time": 12.5,
+            "evaluation_evidence": legacy,
+        })
+        legacy_provenance = module.TritonOptimizerAgent._candidate_provenance(individual)
+        self.assertEqual(legacy_provenance["evaluation_evidence"], legacy)
+
+    def test_candidate_provenance_rejects_untrusted_evaluation_evidence(self):
+        module = load_optimizer_agent()
+        individual = SimpleNamespace(
+            code="candidate",
+            fitness=0.4,
+            generation=1,
+            id="candidate",
+            model_used="deepseek-v4-pro",
+            metadata={
+                "evaluated": True,
+                "success": True,
+                "speedup": 0.4,
+                "execution_time": 12.5,
+                "evaluation_evidence": {
+                    "schema_version": 1,
+                    "kind": "multi-case-real-evaluation",
+                    "official_aggregate": False,
+                    "aggregation": {},
+                    "case_results": [],
+                    "raw_error": "must not escape",
+                },
+            },
+        )
+
+        provenance = module.TritonOptimizerAgent._candidate_provenance(individual)
+
+        self.assertNotIn("evaluation_evidence", provenance)
+        self.assertNotIn("must not escape", json.dumps(provenance))
+
+        individual.metadata["evaluation_evidence"] = self._case_evidence()
+        individual.metadata["execution_time"] = 12.0
+        inconsistent = module.TritonOptimizerAgent._candidate_provenance(individual)
+        self.assertNotIn("evaluation_evidence", inconsistent)
+
+        individual.metadata["execution_time"] = 12.5
+        for label, mutate in (
+            ("boolean schema", lambda evidence: evidence.update(schema_version=True)),
+            (
+                "boolean case id",
+                lambda evidence: evidence["case_results"][0].update(case_id=True),
+            ),
+            (
+                "absolute profile path",
+                lambda evidence: evidence["case_results"][0]["profile"].update(
+                    csv_path="/tmp/OpBasicInfo.csv"
+                ),
+            ),
+            (
+                "profile time mismatch",
+                lambda evidence: evidence["case_results"][0]["profile"].update(
+                    execution_time_us=4.0
+                ),
+            ),
+            (
+                "fingerprint mismatch",
+                lambda evidence: evidence["case_results"][0]["profile"]
+                ["toolchain_fingerprint"].update(sha256="d" * 64),
+            ),
+            (
+                "unknown profile field",
+                lambda evidence: evidence["case_results"][0]["profile"].update(
+                    raw_log="must not escape"
+                ),
+            ),
+            (
+                "speedup formula mismatch",
+                lambda evidence: evidence["case_results"][0].update(speedup=0.6),
+            ),
+        ):
+            with self.subTest(label=label):
+                evidence = self._case_evidence()
+                mutate(evidence)
+                individual.metadata["evaluation_evidence"] = evidence
+                rejected = module.TritonOptimizerAgent._candidate_provenance(individual)
+                self.assertNotIn("evaluation_evidence", rejected)
+
+    def test_save_results_without_candidate_fails_before_writing(self):
+        module = load_optimizer_agent()
+        agent = module.TritonOptimizerAgent.__new__(module.TritonOptimizerAgent)
+        agent.optimization_history = [{
+            "best_code": "baseline",
+            "best_fitness": 0.0,
+            "speedup": 0.0,
+            "generations": 0,
+            "time_elapsed": 0.0,
+            "llm_stats": {"call_count": 0},
+            "top5_codes": [],
+            "best_provenance": {},
+        }]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "No non-baseline candidate"):
+                agent.save_results(tmp, "demo")
+            self.assertEqual(list(Path(tmp).iterdir()), [])
 
 
 class CleanCodeTests(unittest.TestCase):
@@ -583,6 +1079,38 @@ class CleanCodeTests(unittest.TestCase):
         cleaned = llm._clean_code_markers(self.RAW)
         self.assertIn("2.5 * y)", cleaned)
         self.assertNotIn("```", cleaned)
+
+
+class OfficialLlmAllowlistTests(unittest.TestCase):
+    def test_init_rejects_any_non_allowlisted_configured_model_before_client(self):
+        module = load_llm_interface()
+        config = SimpleNamespace(
+            budget_controller=None,
+            llm_models=["deepseek-v4-pro", "deepseek-r1"],
+        )
+
+        with patch.object(module.LLMInterface, "_init_llm") as init_llm:
+            with self.assertRaisesRegex(ValueError, "official competition allowlist"):
+                module.LLMInterface(config)
+
+        init_llm.assert_not_called()
+
+    def test_explicit_initial_model_and_switch_target_fail_closed(self):
+        module = load_llm_interface()
+        config = SimpleNamespace(
+            budget_controller=None,
+            llm_models=["deepseek-v4-pro"],
+        )
+
+        with patch.object(module.LLMInterface, "_init_llm") as init_llm:
+            with self.assertRaisesRegex(ValueError, "official competition allowlist"):
+                module.LLMInterface(config, model_name="not-an-official-model")
+            llm = module.LLMInterface(config)
+            with self.assertRaisesRegex(ValueError, "official competition allowlist"):
+                llm.switch_model("deepseek-r1")
+
+        self.assertEqual(llm.current_model, "deepseek-v4-pro")
+        self.assertEqual(init_llm.call_count, 1)
 
 
 class TokenAccountingTests(unittest.TestCase):
@@ -633,6 +1161,28 @@ class OfficialLlmBudgetTests(unittest.TestCase):
 
         self.assertIs(llm.budget_controller, budget)
         self.assertEqual(llm.total_tokens_used, 7)
+
+    def test_llm_client_does_not_disable_tls_verification(self):
+        module = load_llm_interface()
+        captured = {}
+
+        def fake_client(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        config = SimpleNamespace(
+            budget_controller=None,
+            llm_models=["deepseek-v4-pro"],
+            api_url="https://api.deepseek.com/v1",
+            api_key="test-key",
+            llm_temperature=0.2,
+            max_llm_tokens=128,
+        )
+        with patch.object(module.httpx, "Client", side_effect=fake_client):
+            with patch.object(module, "ChatOpenAI", return_value=object()):
+                module.LLMInterface(config)
+
+        self.assertNotEqual(captured.get("verify"), False)
 
     def test_success_commits_real_usage(self):
         budget = BudgetController(BudgetLimits(10_000, 300))
@@ -796,7 +1346,9 @@ def load_budgeted_optimizer_agent():
             "config": _stub("config", EAConfig=type("EAConfig", (), {})),
             "llm_interface": _stub("llm_interface", LLMInterface=FakeLlm),
             "contract_executor": _stub(
-                "contract_executor", ContractCheckingExecutor=FakeContractExecutor
+                "contract_executor",
+                ContractCheckingExecutor=FakeContractExecutor,
+                MultiCaseContractExecutor=lambda cases: cases[0][1],
             ),
             "executor": _stub(
                 "executor", TritonExecutor=type("TritonExecutor", (), {})

@@ -125,11 +125,18 @@ class OfficialPromptContractTests(unittest.TestCase):
                 "Adjust general tile or launch settings",
                 "BLOCK_SIZE, num_warps, and num_stages",
                 "Remove an optional launch keyword only when current evidence",
+                "First inspect the parent source for existing tile constants",
+                "compare neighboring power-of-two tiles by expected pass count",
+                "do not assume a larger tile is faster",
+                "Do not add fixed num_warps or num_stages merely because",
+                "launch-only configuration was neutral or slower",
                 "Preserve the wrapper calling convention, runtime argument bindings, grid dimensionality",
             ),
             "strategy_change": (
                 "memory-access, work-partitioning, or parallelization strategy",
                 "Reorganize kernel dataflow, access order, work decomposition, or parallel execution",
+                "Materially change at least one authorized strategy surface",
+                "Reordering operands of a commutative expression",
                 "Keep tile and launch settings unless the selected strategy requires",
                 "Do not replace the algorithm",
             ),
@@ -143,6 +150,17 @@ class OfficialPromptContractTests(unittest.TestCase):
         self.assertEqual(set(module.MUTATION_TYPES), set(expected_text))
         self.assertEqual(set(module.MUTATION_SKILL_VERSIONS), set(expected_text))
         self.assertEqual(set(module.MUTATION_SKILL_PROMPTS), set(expected_text))
+        self.assertEqual(
+            module.MUTATION_PROMPT_VERSION, "ascend-triton-mutation-prompt-v4"
+        )
+        self.assertEqual(
+            module.MUTATION_SKILL_VERSIONS["param_tuning"],
+            "ascend-triton-param-tuning-v3",
+        )
+        self.assertEqual(
+            module.MUTATION_SKILL_VERSIONS["strategy_change"],
+            "ascend-triton-strategy-change-v2",
+        )
 
         for mutation_type, required_texts in expected_text.items():
             with self.subTest(mutation_type=mutation_type):

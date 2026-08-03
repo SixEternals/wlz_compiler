@@ -218,6 +218,16 @@ class OutputContractTests(unittest.TestCase):
             self.assertEqual(sidecar["candidate_id"], "candidate")
             self.assertEqual(sidecar["candidate_count"], 1)
             self.assertFalse(Path(sidecar["candidate_manifest_path"]).is_absolute())
+            with zipfile.ZipFile(artifact) as archive:
+                self.assertIsNone(archive.testzip())
+                stats = json.loads(archive.read("output/op_a/op_a_stats.json"))
+            summary = stats["top5_summary"][0]
+            self.assertEqual(summary["code_hash"], hashlib.sha256(code.encode()).hexdigest())
+            self.assertEqual(summary["parent_ids"], [])
+            self.assertEqual(
+                summary["manifest_sha256"],
+                hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            )
             self.assertEqual(
                 sidecar["selections"],
                 [{
@@ -650,6 +660,8 @@ def candidate(x):
             ROOT
             / "output/real-agent-candidates/_set_k_and_s_triton_kernel/fd113ce1.py"
         )
+        if not candidate.is_file():
+            self.skipTest("historical generated candidate is not available")
         self.assertEqual(
             module._structure_hash(baseline.read_text(encoding="utf-8")),
             module._structure_hash(candidate.read_text(encoding="utf-8")),
@@ -791,6 +803,74 @@ def candidate(x):
             )
             self.assertIsNone(manifest["static_evaluation"])
             self.assertIsNone(manifest["import_evaluation"])
+            contract_check.assert_not_called()
+            static_gate.assert_not_called()
+            import_gate.assert_not_called()
+
+    def test_existing_duplicate_candidate_stops_before_static_and_import(self) -> None:
+        module = load_candidate_generator()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            datasets = self._dataset(root, "op_a")
+            output = root / "generated"
+            candidate_dir = output / "op_a"
+            candidate_dir.mkdir(parents=True)
+            duplicate_code = "def baseline():\n    return 2\n"
+            (candidate_dir / "existing.py").write_text(
+                duplicate_code, encoding="utf-8"
+            )
+            contract_check = MagicMock(return_value=None)
+            fake_modules = (
+                SimpleNamespace(
+                    EAConfig=lambda: SimpleNamespace(llm_models=["fake-model"])
+                ),
+                SimpleNamespace(
+                    Individual=SimpleNamespace,
+                    GeneticOperators=lambda *_: SimpleNamespace(
+                        mutate=lambda parent: SimpleNamespace(
+                            code=duplicate_code,
+                            id="duplicate-child",
+                            generation=1,
+                            metadata={"mutation_type": "param_tuning"},
+                            model_used="fake-model",
+                        )
+                    ),
+                ),
+                SimpleNamespace(interface_contract_error=contract_check),
+            )
+            fake_llm = SimpleNamespace(
+                call_history=[{"prompt_sha256": "a" * 64}],
+                get_stats=lambda: {"call_count": 1},
+            )
+            with patch.object(
+                module, "_load_official_modules", return_value=fake_modules
+            ), patch.object(
+                module, "StdlibOpenAIClient", return_value=fake_llm
+            ), patch.object(
+                module.LocalExecutor, "evaluate"
+            ) as static_gate, patch.object(module, "run_candidate") as import_gate:
+                with self.assertRaisesRegex(
+                    ValueError, "duplicates existing candidate: existing"
+                ):
+                    module.generate_candidate(
+                        root,
+                        datasets,
+                        "op_a",
+                        datasets / "op_a" / "op_a.py",
+                        output,
+                        1,
+                    )
+
+            manifest = json.loads(
+                (candidate_dir / "duplicate-child.manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["candidate"]["status"], "rejected")
+            self.assertEqual(
+                manifest["rejection_error"],
+                "Generated candidate duplicates existing candidate: existing",
+            )
             contract_check.assert_not_called()
             static_gate.assert_not_called()
             import_gate.assert_not_called()
