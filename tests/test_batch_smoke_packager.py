@@ -68,6 +68,14 @@ class BatchSmokePackagerTests(unittest.TestCase):
             },
             "rejection_error": None,
             "llm_stats": {"call_count": 1},
+            "holdout_evaluation": {
+                "status": "passed",
+                "split": "holdout",
+                "case_signature": "h" * 64,
+                "case_count": 1,
+                "used_for_search": False,
+                "used_in_prompt": False,
+            },
         }
         if correctness_evaluation is not _MISSING:
             manifest["correctness_evaluation"] = correctness_evaluation
@@ -91,6 +99,52 @@ class BatchSmokePackagerTests(unittest.TestCase):
         path = root / "selection.manifest.json"
         path.write_text(json.dumps({"selections": selections}), encoding="utf-8")
         return path
+
+    def _write_variant(
+        self,
+        root: Path,
+        operator: str,
+        candidate_id: str,
+        expression: str,
+        mutation_kind: str | None = None,
+    ) -> Path:
+        candidate_dir = root / "candidates" / operator
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        code = f"def {operator}(x):\n    return {expression}\n"
+        candidate_path = candidate_dir / f"{candidate_id}.py"
+        candidate_path.write_text(code, encoding="utf-8")
+        candidate = {
+            "id": candidate_id,
+            "op_name": operator,
+            "code_hash": sha256_text(code),
+            "status": "static_pass",
+            "generation": 1,
+        }
+        if mutation_kind is not None:
+            candidate["mutation_kind"] = mutation_kind
+        manifest = {
+            "candidate": candidate,
+            "static_evaluation": {"passed": True},
+            "import_evaluation": {
+                "status": "imported",
+                "phase": "module_import",
+                "error_type": None,
+                "error_message": None,
+            },
+            "rejection_error": None,
+            "llm_stats": {"call_count": 1},
+            "holdout_evaluation": {
+                "status": "passed",
+                "split": "holdout",
+                "case_signature": "h" * 64,
+                "case_count": 1,
+                "used_for_search": False,
+                "used_in_prompt": False,
+            },
+        }
+        manifest_path = candidate_dir / f"{candidate_id}.manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest_path
 
     def _write_historical_source(self, root: Path, selection: Path) -> Path:
         source_zip = root / "historical.zip"
@@ -172,6 +226,84 @@ class BatchSmokePackagerTests(unittest.TestCase):
                     "op_a": "static_import_only",
                 },
             )
+
+    def test_rechecks_interface_contract_before_packaging(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_dir = root / "datasets" / "op_a"
+            dataset_dir.mkdir(parents=True)
+            baseline = """\
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def kernel(x, out, n, BLOCK_SIZE: tl.constexpr):
+    value = tl.load(x)
+    tl.store(out, value)
+
+def op_a(x, out, n):
+    grid = (triton.cdiv(n, 128),)
+    kernel[grid](x, out, n, BLOCK_SIZE=128, num_warps=4)
+    return out
+"""
+            candidate = baseline.replace(
+                "    grid =",
+                "    torch.zeros((1,), device=\"npu\")\n    grid =",
+            )
+            (dataset_dir / "op_a.py").write_text(baseline, encoding="utf-8")
+            (dataset_dir / "test_op_a_1.py").write_text(
+                "from op_a import op_a\n", encoding="utf-8"
+            )
+            candidate_dir = root / "candidates" / "op_a"
+            candidate_dir.mkdir(parents=True)
+            candidate_path = candidate_dir / "candidate.py"
+            candidate_path.write_text(candidate, encoding="utf-8")
+            manifest = {
+                "candidate": {
+                    "id": "candidate",
+                    "op_name": "op_a",
+                    "code_hash": sha256_text(candidate),
+                    "status": "static_pass",
+                    "generation": 1,
+                },
+                "static_evaluation": {"passed": True},
+                "import_evaluation": {
+                    "status": "imported",
+                    "phase": "module_import",
+                },
+                "rejection_error": None,
+            }
+            manifest_path = candidate_dir / "candidate.manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            selection = root / "selection.manifest.json"
+            selection.write_text(
+                json.dumps(
+                    {
+                        "selections": [
+                            {
+                                "operator": "op_a",
+                                "candidate_id": "candidate",
+                                "candidate_sha256": sha256_text(candidate),
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "interface contract preflight.*wrapper timing surface"
+            ):
+                module.build_batch_smoke(
+                    root / "datasets",
+                    root / "candidates",
+                    root / "batch.zip",
+                    selection,
+                )
+            self.assertFalse((root / "batch.zip").exists())
+            self.assertFalse((root / "batch.manifest.json").exists())
 
     def test_rejects_oversize_and_unsafe_archives(self) -> None:
         module = load_module()
@@ -362,6 +494,100 @@ class BatchSmokePackagerTests(unittest.TestCase):
                         )
                     self.assertFalse(artifact.exists())
 
+    def test_local_ascend_manual_admission_requires_bound_evidence(self) -> None:
+        module = load_module()
+        operator = "_count_expert_num_tokens"
+
+        def local_evaluation(artifact_sha256: str) -> dict:
+            return {
+                "admission_policy_id": module._LOCAL_ASCEND_ADMISSION_POLICY_ID,
+                "status": "passed",
+                "eligible_for_performance": True,
+                "blocking_reasons": [],
+                "evidence_scope": "local_ascend_910b4_visible_and_holdout_not_official",
+                "results": [
+                    {
+                        "artifact_path": "correctness.json",
+                        "artifact_sha256": artifact_sha256,
+                        "split": "search_visible",
+                        "status": "passed",
+                    }
+                ],
+                "decision": {
+                    "candidate_id": "candidate",
+                    "eligible_for_performance": True,
+                    "blocking_reasons": [],
+                },
+            }
+
+        for label in (
+            "valid",
+            "missing_artifact_sha",
+            "tampered_artifact",
+            "official_scope",
+            "missing_holdout",
+            "missing_holdout_split",
+            "missing_holdout_used_for_search",
+            "missing_holdout_used_in_prompt",
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                evidence_path = root / "correctness.json"
+                evidence_path.write_text("passed\n", encoding="utf-8")
+                manifest_path = self._write_operator(root, operator)
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["correctness_evaluation"] = local_evaluation(
+                    hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+                )
+                if label == "missing_artifact_sha":
+                    manifest["correctness_evaluation"]["results"][0].pop("artifact_sha256")
+                elif label == "tampered_artifact":
+                    evidence_path.write_text("tampered\n", encoding="utf-8")
+                elif label == "official_scope":
+                    manifest["correctness_evaluation"]["evidence_scope"] = "official_a2_a3"
+                elif label == "missing_holdout":
+                    manifest.pop("holdout_evaluation")
+                elif label == "missing_holdout_split":
+                    manifest["holdout_evaluation"].pop("split")
+                elif label == "missing_holdout_used_for_search":
+                    manifest["holdout_evaluation"].pop("used_for_search")
+                elif label == "missing_holdout_used_in_prompt":
+                    manifest["holdout_evaluation"].pop("used_in_prompt")
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                selection = self._write_selection_lock(root, [operator])
+                artifact = root / "batch.zip"
+                if label == "valid":
+                    sidecar = module.build_batch_smoke(
+                        root / "datasets", root / "candidates", artifact, selection
+                    )
+                    self.assertEqual(
+                        sidecar["selections"][0]["admission_level"],
+                        "local_ascend_910b4_manual_evidence",
+                    )
+                elif label in {"missing_holdout", "missing_holdout_split"}:
+                    with self.assertRaisesRegex(
+                        ValueError, "holdout admission.*holdout_required"
+                    ):
+                        module.build_batch_smoke(
+                            root / "datasets", root / "candidates", artifact, selection
+                        )
+                elif label in {
+                    "missing_holdout_used_for_search",
+                    "missing_holdout_used_in_prompt",
+                }:
+                    with self.assertRaisesRegex(
+                        ValueError, "holdout admission.*holdout_metadata_incomplete"
+                    ):
+                        module.build_batch_smoke(
+                            root / "datasets", root / "candidates", artifact, selection
+                        )
+                else:
+                    with self.assertRaisesRegex(ValueError, "lacks valid"):
+                        module.build_batch_smoke(
+                            root / "datasets", root / "candidates", artifact, selection
+                        )
+                self.assertFalse(artifact.exists() and label != "valid")
+
     def test_refuses_missing_or_failed_import_evidence(self) -> None:
         module = load_module()
         for label, import_evaluation in (
@@ -427,6 +653,333 @@ class BatchSmokePackagerTests(unittest.TestCase):
                 root / "datasets", root / "candidates", root / "batch.zip", selection
             )
             self.assertEqual(sidecar["selections"][0]["candidate_id"], "selected")
+
+    def test_packages_multiple_slots_in_order_without_filling_to_five(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_operator(root, "op_a")
+            first = self._write_variant(root, "op_a", "v1", "x + 1", "launch")
+            second = self._write_variant(root, "op_a", "v2", "x * 2", "strategy")
+            third = self._write_variant(root, "op_a", "v3", "x - 1", "fallback")
+            manifests = [json.loads(path.read_text(encoding="utf-8")) for path in (first, second, third)]
+            selection = root / "selection.manifest.json"
+            selection.write_text(
+                json.dumps(
+                    {
+                        "selections": [
+                            {
+                                "operator": "op_a",
+                                "candidates": [
+                                    {
+                                        "candidate_id": item["candidate"]["id"],
+                                        "candidate_sha256": item["candidate"]["code_hash"],
+                                        "modification_type": kind,
+                                        "local_ratio": ratio,
+                                    }
+                                    for item, kind, ratio in zip(
+                                        manifests,
+                                        ("launch", "strategy", "fallback"),
+                                        (0.8, 0.9, 1.0),
+                                    )
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sidecar = module.build_batch_smoke(
+                root / "datasets", root / "candidates", root / "batch.zip", selection
+            )
+
+            with zipfile.ZipFile(root / "batch.zip") as archive:
+                names = set(archive.namelist())
+                self.assertEqual(
+                    names,
+                    {
+                        "output/op_a/op_a_best.py",
+                        "output/op_a/op_a_stats.json",
+                        "output/op_a/op_a_v1.py",
+                        "output/op_a/op_a_v2.py",
+                        "output/op_a/op_a_v3.py",
+                    },
+                )
+                self.assertEqual(
+                    archive.read("output/op_a/op_a_v1.py"),
+                    (root / "candidates/op_a/v1.py").read_bytes(),
+                )
+                stats = json.loads(archive.read("output/op_a/op_a_stats.json"))
+            self.assertEqual(sidecar["candidate_count"], 3)
+            self.assertEqual(len(sidecar["selections"][0]["candidates"]), 3)
+            self.assertEqual(
+                [item["candidate_variant"] for item in sidecar["selections"][0]["candidates"]],
+                ["op_a_v1", "op_a_v2", "op_a_v3"],
+            )
+            self.assertEqual(
+                [item["modification_type"] for item in stats["top5_summary"]],
+                ["launch", "strategy", "fallback"],
+            )
+            self.assertEqual(
+                [item["local_ratio"] for item in sidecar["selections"][0]["candidates"]],
+                [0.8, 0.9, 1.0],
+            )
+            self.assertEqual(
+                [item["local_ratio"] for item in stats["top5_summary"]],
+                [0.8, 0.9, 1.0],
+            )
+            self.assertNotIn("output/op_a/op_a_v4.py", names)
+            self.assertNotIn("output/op_a/op_a_v5.py", names)
+
+    def test_multi_slot_selection_rejects_baseline_and_unsafe_strategy_pair(self) -> None:
+        module = load_module()
+        cases = ("baseline", "same_type", "unknown_type")
+        for label in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_operator(root, "op_a")
+                if label == "baseline":
+                    first = self._write_variant(root, "op_a", "baseline", "x")
+                    manifests = [json.loads(first.read_text(encoding="utf-8"))]
+                else:
+                    kind = None if label == "unknown_type" else "launch"
+                    first = self._write_variant(root, "op_a", "v1", "x + 1", kind)
+                    second = self._write_variant(root, "op_a", "v2", "x * 2", kind)
+                    manifests = [
+                        json.loads(path.read_text(encoding="utf-8"))
+                        for path in (first, second)
+                    ]
+                selection = root / "selection.manifest.json"
+                selection.write_text(
+                    json.dumps(
+                        {
+                            "selections": [
+                                {
+                                    "operator": "op_a",
+                                    "candidates": [
+                                        {
+                                            "candidate_id": item["candidate"]["id"],
+                                            "candidate_sha256": item["candidate"]["code_hash"],
+                                        }
+                                        for item in manifests
+                                    ],
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "baseline candidate|different modification types|Missing modification type",
+                ):
+                    module.build_batch_smoke(
+                        root / "datasets", root / "candidates", root / "batch.zip", selection
+                    )
+
+    def test_functional_fallback_requires_v3_slot(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_operator(root, "op_a")
+            fallback = self._write_variant(root, "op_a", "fallback", "x + 1", "launch")
+            manifest = json.loads(fallback.read_text(encoding="utf-8"))
+            manifest["local_performance_evaluation"] = {
+                "intended_slot": "v3_functional_fallback_only"
+            }
+            fallback.write_text(json.dumps(manifest), encoding="utf-8")
+            candidate = manifest["candidate"]
+            selection = root / "selection.manifest.json"
+            selection.write_text(
+                json.dumps(
+                    {
+                        "selections": [
+                            {
+                                "operator": "op_a",
+                                "candidate_id": candidate["id"],
+                                "candidate_sha256": candidate["code_hash"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Functional fallback candidate.*slot 3"):
+                module.build_batch_smoke(
+                    root / "datasets", root / "candidates", root / "batch.zip", selection
+                )
+
+    def test_rejects_malformed_local_performance_evaluation(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = self._write_operator(root, "op_a")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["local_performance_evaluation"] = []
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            selection = self._write_selection_lock(root, ["op_a"])
+
+            with self.assertRaisesRegex(
+                ValueError, "Invalid local_performance_evaluation"
+            ):
+                module.build_batch_smoke(
+                    root / "datasets", root / "candidates", root / "batch.zip", selection
+                )
+
+    def test_current_admission_requires_independent_holdout_evidence(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = self._write_operator(root, "op_a")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.pop("holdout_evaluation")
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            selection = self._write_selection_lock(root, ["op_a"])
+            with self.assertRaisesRegex(ValueError, "holdout admission.*holdout_required"):
+                module.build_batch_smoke(
+                    root / "datasets", root / "candidates", root / "batch.zip", selection
+                )
+
+    def test_candidate_only_functional_admission_requires_explicit_control_failure(self) -> None:
+        module = load_module()
+        operator = "_chunk_cumsum_fwd_kernel"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = self._write_operator(root, operator)
+            evidence = root / "chunk-cumsum-candidate-only.json"
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "baseline_status": "failed",
+                        "candidate_status": "passed",
+                        "status": "candidate_passed_baseline_failed",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            evidence_sha256 = hashlib.sha256(evidence.read_bytes()).hexdigest()
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            candidate_id = manifest["candidate"]["id"]
+            candidate_hash = manifest["candidate"]["code_hash"]
+            result = {
+                "artifact_path": evidence.name,
+                "artifact_sha256": evidence_sha256,
+                "baseline_status": "failed",
+                "candidate_status": "passed",
+                "split": "holdout",
+                "status": "candidate_passed_baseline_failed",
+            }
+            manifest["correctness_evaluation"] = {
+                "admission_policy_id": module._CANDIDATE_ONLY_FUNCTIONAL_POLICY_ID,
+                "blocking_reasons": [],
+                "decision": {
+                    "candidate_id": candidate_id,
+                    "eligible_for_performance": True,
+                    "blocking_reasons": [],
+                },
+                "evidence_scope": "local_ascend_910b4_derived_shape_matrix_not_official",
+                "eligible_for_performance": True,
+                "results": [result],
+                "status": module._CANDIDATE_ONLY_FUNCTIONAL_STATUS,
+            }
+            manifest["holdout_evaluation"] = {
+                "baseline_sha256": "b" * 64,
+                "baseline_status": "failed",
+                "candidate_id": candidate_id,
+                "candidate_sha256": candidate_hash,
+                "candidate_status": "passed",
+                "case_count": 1,
+                "case_signature": "c" * 64,
+                "correctness_artifact_path": evidence.name,
+                "correctness_artifact_sha256": evidence_sha256,
+                "split": "holdout",
+                "status": module._CANDIDATE_ONLY_HOLDOUT_STATUS,
+                "used_for_search": False,
+                "used_in_prompt": False,
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            selection = self._write_selection_lock(root, [operator])
+
+            sidecar = module.build_batch_smoke(
+                root / "datasets", root / "candidates", root / "batch.zip", selection
+            )
+            self.assertTrue((root / "batch.zip").is_file())
+            self.assertEqual(
+                sidecar["selections"][0]["admission_level"],
+                "local_ascend_910b4_candidate_only_functional",
+            )
+
+    def test_set_k_fp8_candidate_only_admission_is_operator_scoped(self) -> None:
+        module = load_module()
+        policy = module._SET_K_CANDIDATE_ONLY_FUNCTIONAL_POLICY_ID
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = self._write_operator(
+                root, "_set_k_and_s_triton_kernel"
+            )
+            evidence = root / "set-k-fp8.json"
+            evidence.write_text(
+                json.dumps({"baseline": "failed", "candidate": "passed"}),
+                encoding="utf-8",
+            )
+            evidence_sha256 = hashlib.sha256(evidence.read_bytes()).hexdigest()
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            candidate = manifest["candidate"]
+            result = {
+                "artifact_path": evidence.name,
+                "artifact_sha256": evidence_sha256,
+                "baseline_status": "failed",
+                "candidate_status": "passed",
+                "split": "search_visible",
+                "status": "baseline_failed",
+            }
+            manifest["correctness_evaluation"] = {
+                "admission_policy_id": policy,
+                "blocking_reasons": [],
+                "decision": {
+                    "candidate_id": candidate["id"],
+                    "eligible_for_performance": True,
+                    "blocking_reasons": [],
+                },
+                "evidence_scope": "local_ascend_910b4_derived_shape_matrix_not_official",
+                "eligible_for_performance": True,
+                "results": [result],
+                "status": module._CANDIDATE_ONLY_FUNCTIONAL_STATUS,
+            }
+            manifest["holdout_evaluation"] = {
+                "baseline_sha256": "b" * 64,
+                "baseline_status": "failed",
+                "candidate_id": candidate["id"],
+                "candidate_sha256": candidate["code_hash"],
+                "candidate_status": "passed",
+                "case_count": 1,
+                "case_signature": "c" * 64,
+                "correctness_artifact_path": evidence.name,
+                "correctness_artifact_sha256": evidence_sha256,
+                "split": "holdout",
+                "status": module._CANDIDATE_ONLY_HOLDOUT_STATUS,
+                "used_for_search": False,
+                "used_in_prompt": False,
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            selection = self._write_selection_lock(
+                root, ["_set_k_and_s_triton_kernel"]
+            )
+
+            sidecar = module.build_batch_smoke(
+                root / "datasets", root / "candidates", root / "batch.zip", selection
+            )
+            self.assertEqual(
+                sidecar["selections"][0]["admission_level"],
+                "local_ascend_910b4_candidate_only_functional",
+            )
+            self.assertFalse(
+                module._has_candidate_only_functional_admission(
+                    "op_a", manifest, candidate["id"], (root,)
+                )
+            )
 
     def test_selection_lock_rejects_missing_duplicate_and_hash_mismatch(self) -> None:
         module = load_module()

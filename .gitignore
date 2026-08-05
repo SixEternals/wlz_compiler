@@ -9,10 +9,12 @@ __pycache__/
 *.pyc
 /.secrets/
 .jj/
-doc/
+# Curated project docs are tracked; downloaded source archives stay local-only.
 # Downloaded references and embedded upstream repositories are local-only.
 doc/sources/
 doc/repos/
+# Downloaded paper PDFs stay local-only; curated digests under doc/learn are tracked.
+doc/learn/*.pdf
 ref/
 tmp/
 

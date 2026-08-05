@@ -148,6 +148,8 @@ class _Stats:
     max_rel: Optional[float] = None
     first_kind: Optional[str] = None
     first_message: Optional[str] = None
+    invalid_reference: bool = False
+    invalid_message: Optional[str] = None
 
     def mismatch(self, kind: str, message: str) -> None:
         self.compared += 1
@@ -167,6 +169,11 @@ class _Stats:
             if self.first_kind is None:
                 self.first_kind = kind
                 self.first_message = _bounded(message)
+
+    def reference_invalid(self, message: str) -> None:
+        self.invalid_reference = True
+        if self.invalid_message is None:
+            self.invalid_message = _bounded(message)
 
     def summary(self) -> CorrectnessErrorSummary:
         return CorrectnessErrorSummary(
@@ -228,6 +235,12 @@ def compare_oracle(
         )
 
     summary = stats.summary()
+    if stats.invalid_reference:
+        return OracleComparison(
+            "oracle_error",
+            compared_targets,
+            message=_bounded(f"golden_invalid: {stats.invalid_message or 'non-finite golden'}"),
+        )
     return OracleComparison(
         "passed" if stats.mismatches == 0 else "failed",
         compared_targets,
@@ -382,7 +395,15 @@ def _compare_tensor(
         return
     floating = _is_floating_dtype(expected.dtype)
     for index, (actual_item, expected_item) in enumerate(zip(actual.values, expected.values)):
-        _compare_scalar(actual_item, expected_item, policy, stats, f"{path}[{index}]", floating)
+        _compare_scalar(
+            actual_item,
+            expected_item,
+            policy,
+            stats,
+            f"{path}[{index}]",
+            floating,
+            expected.dtype,
+        )
 
 
 def _compare_scalar(
@@ -392,6 +413,7 @@ def _compare_scalar(
     stats: _Stats,
     path: str,
     floating: bool,
+    dtype: Optional[str] = None,
 ) -> None:
     numeric = (
         not isinstance(actual, bool)
@@ -399,6 +421,9 @@ def _compare_scalar(
         and isinstance(actual, (int, float))
         and isinstance(expected, (int, float))
     )
+    if policy.kind == "official_segmented":
+        _compare_official_scalar(actual, expected, policy, stats, path, dtype)
+        return
     if floating and numeric:
         actual_float, expected_float = float(actual), float(expected)
         if math.isnan(actual_float) or math.isnan(expected_float):
@@ -428,6 +453,113 @@ def _compare_scalar(
 def _is_floating_dtype(dtype: str) -> bool:
     name = dtype.lower().rsplit(".", 1)[-1]
     return "float" in name or name in {"half", "double"}
+
+
+_FP16_MAX = 65504.0
+
+
+def _official_dtype_family(policy: OraclePolicy, dtype: Optional[str]) -> str:
+    if policy.dtype_family is not None:
+        return policy.dtype_family
+    if dtype is None:
+        return "unknown"
+    name = dtype.lower().rsplit(".", 1)[-1]
+    if name in {"float16", "half", "fp16"}:
+        return "fp16"
+    if name in {"bfloat16", "bf16"}:
+        return "bf16"
+    if name in {"float32", "float", "fp32"}:
+        return "fp32"
+    if "int" in name or name in {"uint8", "uint16", "uint32", "uint64"}:
+        return "integer"
+    return "unknown"
+
+
+def _official_threshold(dtype_family: str, accumulation_count: Optional[int]) -> float:
+    """Return the official table value; BF16's reversed rows are intentional."""
+
+    count = accumulation_count
+    if dtype_family == "fp16":
+        return 2.0 ** (-8 if count is None or count < 2048 else -7)
+    if dtype_family == "bf16":
+        # This is the official table, including its non-monotonic direction.
+        return 2.0 ** (-8 if count is None else (-7 if count < 2048 else -8))
+    # Unknown dtype families deliberately use the strictest FP32 table rather
+    # than silently widening tolerance when the contract is incomplete.
+    if dtype_family == "fp32" or dtype_family == "unknown":
+        if count is None or count < 2048:
+            return 2.0 ** -11
+        if count < 16384:
+            return 2.0 ** -10
+        return 2.0 ** -9
+    return 0.0
+
+
+def _compare_official_scalar(
+    actual: Any,
+    expected: Any,
+    policy: OraclePolicy,
+    stats: _Stats,
+    path: str,
+    dtype: Optional[str],
+) -> None:
+    family = _official_dtype_family(policy, dtype)
+    numeric = (
+        not isinstance(actual, bool)
+        and not isinstance(expected, bool)
+        and isinstance(actual, (int, float))
+        and isinstance(expected, (int, float))
+    )
+    if not numeric or family == "integer":
+        matches = type(actual) is type(expected) and actual == expected
+        stats.value(matches, "value", f"{path}: expected {expected!r}, got {actual!r}", None, None)
+        return
+
+    expected_float = float(expected)
+    actual_float = float(actual)
+    if not math.isfinite(expected_float):
+        stats.reference_invalid(f"{path}: golden value is {expected!r}")
+        return
+    if not math.isfinite(actual_float):
+        overflow = (
+            family == "fp16"
+            and math.isinf(actual_float)
+            and abs(expected_float) > _FP16_MAX
+            and math.copysign(1.0, actual_float) == math.copysign(1.0, expected_float)
+        )
+        stats.value(
+            overflow,
+            "nonfinite",
+            f"{path}: expected {expected!r}, got {actual!r}",
+            None,
+            None,
+        )
+        return
+
+    threshold = _official_threshold(family, policy.accumulation_count)
+    absolute = abs(actual_float - expected_float)
+    if abs(expected_float) >= 1.0:
+        relative = abs((actual_float - expected_float) / (expected_float + 1e-7))
+        stats.value(
+            relative <= threshold,
+            "relative",
+            f"{path}: relative error {relative!r} exceeds {threshold!r}",
+            absolute,
+            relative,
+        )
+    else:
+        relative = (
+            absolute / abs(expected_float)
+            if expected_float != 0.0
+            else None
+        )
+        stats.value(
+            absolute <= threshold,
+            "absolute",
+            f"{path}: absolute error {absolute!r} exceeds {threshold!r}",
+            absolute,
+            relative,
+        )
 
 
 def _bounded(message: str) -> str:

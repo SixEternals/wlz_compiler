@@ -417,7 +417,7 @@ class OracleTarget:
 
 @dataclass
 class OraclePolicy:
-    """Versioned value, shape, or tensor-metadata policy."""
+    """Versioned value, shape, metadata, or official segmented policy."""
 
     reference_id: str
     policy_id: str
@@ -425,15 +425,24 @@ class OraclePolicy:
     rtol: Optional[float] = None
     atol: Optional[float] = None
     equal_nan: bool = False
+    dtype_family: Optional[str] = None
+    accumulation_count: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference_id, str) or not self.reference_id.strip():
             raise ValueError("oracle reference_id must not be empty")
         if not isinstance(self.policy_id, str) or not self.policy_id.strip():
             raise ValueError("oracle policy_id must not be empty")
-        if self.kind not in {"exact", "allclose", "shape", "metadata"}:
+        if self.kind not in {
+            "exact",
+            "allclose",
+            "shape",
+            "metadata",
+            "official_segmented",
+        }:
             raise ValueError(
-                "oracle kind must be 'exact', 'allclose', 'shape', or 'metadata'"
+                "oracle kind must be 'exact', 'allclose', 'shape', 'metadata', or "
+                "'official_segmented'"
             )
         if not isinstance(self.equal_nan, bool):
             raise ValueError("oracle equal_nan must be a boolean")
@@ -452,9 +461,46 @@ class OraclePolicy:
                     or value < 0
                 ):
                     raise ValueError(f"allclose oracle {name} must be finite and non-negative")
+        if self.kind != "official_segmented" and (
+            self.dtype_family is not None or self.accumulation_count is not None
+        ):
+            raise ValueError(
+                f"{self.kind} oracle policy must not define official segmented fields"
+            )
+        if self.kind == "official_segmented":
+            if self.rtol is not None or self.atol is not None:
+                raise ValueError(
+                    "official_segmented oracle policy must not define allclose tolerances"
+                )
+            if self.equal_nan:
+                raise ValueError(
+                    "official_segmented oracle policy must reject NaN reference values"
+                )
+            if self.dtype_family is not None and self.dtype_family not in {
+                "fp16",
+                "bf16",
+                "fp32",
+                "integer",
+                "unknown",
+            }:
+                raise ValueError("unsupported official segmented dtype_family")
+            if self.accumulation_count is not None and (
+                isinstance(self.accumulation_count, bool)
+                or not isinstance(self.accumulation_count, int)
+                or self.accumulation_count <= 0
+            ):
+                raise ValueError(
+                    "official segmented accumulation_count must be a positive integer or None"
+                )
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # Keep legacy case signatures stable: segmented-only fields are not
+        # part of older allclose/exact/shape/metadata policy payloads.
+        if self.kind != "official_segmented":
+            data.pop("dtype_family", None)
+            data.pop("accumulation_count", None)
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "OraclePolicy":
@@ -465,6 +511,8 @@ class OraclePolicy:
             rtol=data.get("rtol"),
             atol=data.get("atol"),
             equal_nan=data.get("equal_nan", False),
+            dtype_family=data.get("dtype_family"),
+            accumulation_count=data.get("accumulation_count"),
         )
 
 

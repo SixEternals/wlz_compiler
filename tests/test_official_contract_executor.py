@@ -234,7 +234,133 @@ class OfficialContractExecutorTests(unittest.TestCase):
         body_only_change = baseline.replace("return x", "return x * scale")
         self.assertIsNone(module.interface_contract_error(baseline, body_only_change))
 
-    def test_invalid_candidate_is_rejected_before_official_executor(self) -> None:
+    def test_interface_contract_and_holdout_gates_cover_noop_shape_timing_and_holdout(self) -> None:
+        # The anti-overfitting gates are reached through the live
+        # interface_contract_error path (no separate wrapper function). The
+        # synthetic cases below control the inputs precisely enough to assert the
+        # exact gate label; the real historical candidates are asserted to be
+        # rejected, since interface_contract_error runs signature/JIT checks
+        # before the timing gate and any of those is a valid rejection.
+        sys.path.insert(0, str(OFFICIAL_WORK))
+        try:
+            module = importlib.import_module("contract_executor")
+        finally:
+            sys.path.remove(str(OFFICIAL_WORK))
+
+        baseline = (
+            "def op(x, n):\n"
+            "    message = f'baseline {n}'\n"
+            "    return x\n"
+        )
+        presentation_only = baseline.replace("baseline", "changed") + "# comment\n"
+        self.assertEqual(
+            module.interface_contract_error(
+                baseline, presentation_only, enforce_semantic_change=True
+            ),
+            "no_semantic_change",
+        )
+        selective_parent = (
+            ROOT
+            / "work/official_triton_agent/datasets/_selective_scan_update_kernel/"
+            / "_selective_scan_update_kernel.py"
+        )
+        selective_candidate = (
+            ROOT
+            / "output/real-agent-candidates/_selective_scan_update_kernel/"
+            / "localv-4f49e502d013.py"
+        )
+        self.assertEqual(
+            module.interface_contract_error(
+                selective_parent.read_text(encoding="utf-8"),
+                selective_candidate.read_text(encoding="utf-8"),
+                enforce_semantic_change=True,
+            ),
+            "no_semantic_change",
+        )
+
+        shape_candidate = baseline.replace(
+            "    return x\n",
+            "    if n == 256:\n        return x\n    return x\n",
+        )
+        self.assertEqual(
+            module.interface_contract_error(
+                baseline, shape_candidate, visible_shape_values={256}
+            ),
+            "shape_fingerprint",
+        )
+        source_derived = shape_candidate.replace("n == 256", "n == BLOCK")
+        self.assertIsNone(
+            module.interface_contract_error(
+                baseline, source_derived, visible_shape_values={256}
+            )
+        )
+
+        # The shape gate arms itself from the test source when no explicit set is
+        # passed: a test that builds a (2, 256) tensor makes 256 a visible shape.
+        auto_test = (
+            "import torch\n"
+            "def test_op():\n"
+            "    x = torch.randn(2, 256)\n"
+            "    op(x, 256)\n"
+        )
+        self.assertEqual(
+            module.interface_contract_error(baseline, shape_candidate, auto_test),
+            "shape_fingerprint",
+        )
+
+        timing_baseline = (
+            "import torch\n"
+            "def op(x):\n"
+            "    return x\n"
+        )
+        timing_candidate = timing_baseline.replace(
+            "    return x\n", "    torch.cumsum(x, dim=0)\n    return x\n"
+        )
+        self.assertIn(
+            "wrapper timing surface",
+            module.interface_contract_error(timing_baseline, timing_candidate),
+        )
+        pack_parent = (
+            ROOT
+            / "work/official_triton_agent/datasets/_pack_seq_kernel/_pack_seq_kernel.py"
+        )
+        pack_candidate = (
+            ROOT
+            / "output/real-agent-candidates/_pack_seq_kernel/ebfbd9806f27.py"
+        )
+        self.assertIsNotNone(
+            module.interface_contract_error(
+                pack_parent.read_text(encoding="utf-8"),
+                pack_candidate.read_text(encoding="utf-8"),
+            ),
+        )
+
+        self.assertEqual(module.holdout_gate_error(None), "holdout_required")
+        self.assertIsNone(
+            module.holdout_gate_error(
+                {
+                    "status": "passed",
+                    "split": "holdout",
+                    "case_count": 1,
+                    "case_signature": "h" * 64,
+                    "used_for_search": False,
+                }
+            )
+        )
+        self.assertEqual(
+            module.holdout_gate_error(
+                {
+                    "status": "passed",
+                    "split": "holdout",
+                    "case_count": 1,
+                    "case_signature": "h" * 64,
+                    "used_for_search": True,
+                }
+            ),
+            "holdout_search_contamination",
+        )
+
+    def test_wrapper_contract_is_rejected_before_official_executor(self) -> None:
         sys.path.insert(0, str(OFFICIAL_WORK))
         try:
             module = importlib.import_module("contract_executor")
@@ -248,17 +374,21 @@ class OfficialContractExecutorTests(unittest.TestCase):
                 "@triton.jit",
                 "def kernel(x, BLOCK_SIZE: tl.constexpr):",
                 "    return",
+                "def wrapper(x):",
+                "    return x",
             ]
         )
-        candidate = baseline.replace(
-            "@triton.jit",
-            "@triton.autotune(configs=[], key=[])\n@triton.jit",
+        candidate = baseline.replace("def wrapper(x):", "def wrapper(x, scale=1):")
+        jit_tuned = baseline.replace(
+            "@triton.jit", "@triton.autotune(configs=[], key=[])\n@triton.jit"
         )
 
         with tempfile.TemporaryDirectory() as tmp:
+            test_path = Path(tmp) / "test_kernel.py"
+            test_path.write_text("from kernel import wrapper\n", encoding="utf-8")
             executor = module.ContractCheckingExecutor(
                 baseline_time=1.0,
-                test_code_path=str(Path(tmp) / "test_kernel.py"),
+                test_code_path=str(test_path),
                 config=types.SimpleNamespace(),
                 kernel_name="kernel",
                 work_dir=Path(tmp),
@@ -270,9 +400,130 @@ class OfficialContractExecutorTests(unittest.TestCase):
                 accepted = executor.evaluate(baseline)
 
         self.assertFalse(rejected.success)
-        self.assertIn("decorators differ from baseline", rejected.error)
+        self.assertIn("signature differs from baseline: wrapper", rejected.error)
         delegate.assert_called_once_with(baseline, timeout=1200)
         self.assertIs(accepted, delegated_result)
+        self.assertIn(
+            "Triton JIT decorators differ",
+            module.interface_contract_error(baseline, jit_tuned),
+        )
+
+    def test_contract_rejects_wrapper_work_outside_profiled_kernel(self) -> None:
+        sys.path.insert(0, str(OFFICIAL_WORK))
+        try:
+            module = importlib.import_module("contract_executor")
+        finally:
+            sys.path.remove(str(OFFICIAL_WORK))
+
+        baseline = """\
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def kernel(x, out, n, BLOCK_SIZE: tl.constexpr):
+    value = tl.load(x)
+    tl.store(out, value)
+
+def wrapper(x, out, n):
+    grid = (triton.cdiv(n, 128),)
+    kernel[grid](x, out, n, BLOCK_SIZE=128, num_warps=4)
+    return out
+"""
+        rejected = {
+            "device op": baseline.replace(
+                "    grid =", "    prefix = torch.cumsum(x, dim=0)\n    grid ="
+            ),
+            "synchronize": baseline.replace(
+                "    grid =", "    torch.npu.synchronize()\n    grid ="
+            ),
+            "host materialization": baseline.replace(
+                "    grid =", "    value = x.cpu().tolist()\n    grid ="
+            ),
+            "duplicate launch": baseline.replace(
+                "    return out",
+                "    kernel[grid](x, out, n, BLOCK_SIZE=128)\n    return out",
+            ),
+            "changed binding": baseline.replace(
+                "kernel[grid](x, out, n,", "kernel[grid](out, x, n,"
+            ),
+            "looped launch": baseline.replace(
+                "    kernel[grid](x, out, n, BLOCK_SIZE=128, num_warps=4)",
+                "    for _ in range(2):\n"
+                "        kernel[grid](x, out, n, BLOCK_SIZE=128, num_warps=4)",
+            ),
+        }
+        for label, candidate in rejected.items():
+            with self.subTest(label=label):
+                error = module.interface_contract_error(baseline, candidate)
+                self.assertIsNotNone(error)
+                self.assertIn("wrapper timing surface", error)
+
+        layout_baseline = baseline.replace(
+            "    grid =", "    packed = out.view(torch.bfloat16)\n    grid ="
+        ).replace("kernel[grid](x, out, n,", "kernel[grid](x, packed, n,")
+        layout_candidate = layout_baseline.replace(
+            "out.view(torch.bfloat16)", "out.view(torch.float32)"
+        )
+        self.assertIsNone(
+            module.interface_contract_error(layout_baseline, layout_candidate)
+        )
+
+        tuned = (
+            baseline.replace("value = tl.load(x)", "value = tl.load(x) + 1")
+            .replace(
+                "BLOCK_SIZE: tl.constexpr",
+                "TILE: tl.constexpr = 128, EXTRA: tl.constexpr = 1",
+            )
+            .replace("triton.cdiv(n, 128)", "triton.cdiv(n, 256)")
+            .replace("BLOCK_SIZE=128", "TILE=256, EXTRA=2")
+            .replace("num_warps=4", "num_warps=2")
+        )
+        self.assertIsNone(module.interface_contract_error(baseline, tuned))
+        self.assertIn(
+            "external signature differs",
+            module.interface_contract_error(
+                baseline, tuned, "from kernel import kernel\n"
+            ),
+        )
+
+        runtime_added = baseline.replace(
+            "n, BLOCK_SIZE: tl.constexpr",
+            "n, extra_ptr, BLOCK_SIZE: tl.constexpr",
+        )
+        self.assertIn(
+            "runtime signature differs",
+            module.interface_contract_error(baseline, runtime_added),
+        )
+        reclassified = baseline.replace(
+            "def kernel(x, out, n, BLOCK_SIZE",
+            "def kernel(x, out, n: tl.constexpr, BLOCK_SIZE",
+        )
+        self.assertIn(
+            "runtime signature differs",
+            module.interface_contract_error(baseline, reclassified),
+        )
+
+        keyword_baseline = baseline.replace(
+            "kernel[grid](x, out, n,", "kernel[grid](x=x, out=out, n=n,"
+        )
+        alpha_renamed = (
+            keyword_baseline.replace("def kernel(x, out, n,", "def kernel(src, dst, length,")
+            .replace("tl.load(x)", "tl.load(src)")
+            .replace("tl.store(out,", "tl.store(dst,")
+            .replace(
+                "kernel[grid](x=x, out=out, n=n,",
+                "kernel[grid](src=x, dst=out, length=n,",
+            )
+        )
+        self.assertIsNone(
+            module.interface_contract_error(keyword_baseline, alpha_renamed)
+        )
+        swapped = alpha_renamed.replace("src=x, dst=out", "src=out, dst=x")
+        self.assertIn(
+            "changes launch bindings",
+            module.interface_contract_error(keyword_baseline, swapped),
+        )
 
     def test_optimizer_setup_uses_contract_checking_executor(self) -> None:
         sys.path.insert(0, str(OFFICIAL_WORK))

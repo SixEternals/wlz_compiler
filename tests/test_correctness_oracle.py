@@ -1,5 +1,6 @@
 """Focused tests for the backend-neutral correctness oracle."""
 
+import math
 import unittest
 
 from wlz_optimizer.correctness_oracle import (
@@ -32,6 +33,16 @@ def policy(kind="allclose", equal_nan=False):
         rtol=1e-3 if kind == "allclose" else None,
         atol=1e-4 if kind == "allclose" else None,
         equal_nan=equal_nan,
+    )
+
+
+def official_policy(dtype_family=None, accumulation_count=None):
+    return OraclePolicy(
+        reference_id="official.v1",
+        policy_id="official-segmented.v1",
+        kind="official_segmented",
+        dtype_family=dtype_family,
+        accumulation_count=accumulation_count,
     )
 
 
@@ -99,6 +110,113 @@ class CorrectnessOracleTests(unittest.TestCase):
         self.assertEqual(outside.status, "failed")
         self.assertEqual(exact.status, "failed")
         self.assertGreater(outside.error_summary.max_rel_error, 0)
+
+    def test_official_segmented_threshold_boundaries_for_all_dtypes(self):
+        rows = (
+            ("fp16", 2047, 2.0**-8),
+            ("fp16", 2048, 2.0**-7),
+            ("bf16", 2047, 2.0**-7),
+            ("bf16", 2048, 2.0**-8),
+            ("fp32", 2047, 2.0**-11),
+            ("fp32", 2048, 2.0**-10),
+            ("fp32", 16383, 2.0**-10),
+            ("fp32", 16384, 2.0**-9),
+        )
+        for dtype_family, count, threshold in rows:
+            with self.subTest(dtype_family=dtype_family, count=count):
+                expected = 2.0
+                within = expected + expected * threshold * 0.5
+                outside = expected + expected * threshold * 1.5
+                passed = compare_oracle(
+                    official_policy(dtype_family, count),
+                    [target()],
+                    snapshot(tensor([within], dtype=dtype_family)),
+                    snapshot(tensor([expected], dtype=dtype_family)),
+                )
+                failed = compare_oracle(
+                    official_policy(dtype_family, count),
+                    [target()],
+                    snapshot(tensor([outside], dtype=dtype_family)),
+                    snapshot(tensor([expected], dtype=dtype_family)),
+                )
+                self.assertEqual(passed.status, "passed")
+                self.assertEqual(failed.status, "failed")
+                self.assertEqual(failed.error_summary.mismatch_kind, "relative")
+
+    def test_official_segmented_uses_absolute_error_below_one_and_strict_unknown(self):
+        expected = 0.5
+        threshold = 2.0**-8
+        within = compare_oracle(
+            official_policy("fp16", 2047),
+            [target()],
+            snapshot(tensor([expected + threshold * 0.5], dtype="float16")),
+            snapshot(tensor([expected], dtype="float16")),
+        )
+        outside = compare_oracle(
+            official_policy("fp16", 2047),
+            [target()],
+            snapshot(tensor([expected + threshold * 1.5], dtype="float16")),
+            snapshot(tensor([expected], dtype="float16")),
+        )
+        unknown_bf16 = compare_oracle(
+            official_policy("bf16"),
+            [target()],
+            snapshot(tensor([2.0 + 2.0 * (2.0**-8) * 1.25], dtype="bf16")),
+            snapshot(tensor([2.0], dtype="bf16")),
+        )
+
+        self.assertEqual(within.status, "passed")
+        self.assertEqual(outside.status, "failed")
+        self.assertEqual(outside.error_summary.mismatch_kind, "absolute")
+        self.assertEqual(unknown_bf16.status, "failed")
+
+    def test_official_segmented_distinguishes_invalid_golden_and_candidate_nonfinite(self):
+        invalid = compare_oracle(
+            official_policy("fp32", 1),
+            [target()],
+            snapshot(tensor([1.0], dtype="float32")),
+            snapshot(tensor([float("nan")], dtype="float32")),
+        )
+        candidate_nan = compare_oracle(
+            official_policy("fp32", 1),
+            [target()],
+            snapshot(tensor([float("nan")], dtype="float32")),
+            snapshot(tensor([1.0], dtype="float32")),
+        )
+        candidate_inf = compare_oracle(
+            official_policy("fp32", 1),
+            [target()],
+            snapshot(tensor([float("inf")], dtype="float32")),
+            snapshot(tensor([1.0], dtype="float32")),
+        )
+        fp16_overflow = compare_oracle(
+            official_policy("fp16", 1),
+            [target()],
+            snapshot(tensor([float("inf")], dtype="float16")),
+            snapshot(tensor([70000.0], dtype="float16")),
+        )
+
+        self.assertEqual(invalid.status, "oracle_error")
+        self.assertIn("golden_invalid", invalid.message)
+        self.assertEqual(candidate_nan.status, "failed")
+        self.assertEqual(candidate_inf.status, "failed")
+        self.assertEqual(fp16_overflow.status, "passed")
+
+    def test_official_policy_roundtrip_and_validation(self):
+        original = official_policy("bf16", 2048)
+        restored = OraclePolicy.from_dict(original.to_dict())
+        self.assertEqual(restored, original)
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            official_policy("fp16", 0)
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            official_policy("tf32", 1)
+        with self.assertRaisesRegex(ValueError, "must reject NaN"):
+            OraclePolicy(
+                "official.v1",
+                "official-segmented.v1",
+                "official_segmented",
+                equal_nan=True,
+            )
 
     def test_shape_policy_ignores_dtype_and_values_but_rejects_shape_mismatch(self):
         same_shape = compare_oracle(
