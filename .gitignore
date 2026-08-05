@@ -9,6 +9,9 @@ __pycache__/
 *.pyc
 /.secrets/
 .jj/
+.claude/
+doc/
+AGENTS.md
 # Curated project docs are tracked; downloaded source archives stay local-only.
 # Downloaded references and embedded upstream repositories are local-only.
 doc/sources/

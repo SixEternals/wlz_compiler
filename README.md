@@ -1,4 +1,4 @@
-# PPT视频网盘地址
+# PPT视频网盘地址1
 我用夸克网盘给你分享了「比赛项目PPT视频讲解」，点击链接或复制整段内容，打开「夸克APP」即可获取。
 /~3ae73a0jNk~:/
 链接：https://pan.quark.cn/s/68a74881d396
@@ -47,16 +47,6 @@ WLZ_PYTHON="$PWD/.venv/bin/python"
 ```
 
 本机 Ascend 运行需要明确配置的 CANN、设备和测试环境，不应把普通本地环境或 CUDA proxy 结果当作官方评测结果。
-
-## 重新生成 PPTX
-
-```bash
-WLZ_PYTHON="$PWD/.venv/bin/python"
-"$WLZ_PYTHON" scripts/build_project_intro_ppt.py
-unzip -t doc/项目介绍PPT.pptx
-```
-
-生成脚本只使用 Python 标准库，不新增运行时依赖。PPTX 建议使用 PowerPoint 或 WPS 打开检查中文字体、动画和最终排版。
 
 ## 合规与提交边界
 
