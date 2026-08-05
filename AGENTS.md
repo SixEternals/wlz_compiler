@@ -13,19 +13,24 @@ optimization and low-cost local development before real Ascend evaluation.
 
 Important local documents:
 
+- `doc/README.md`
+- `doc/00-最新成果-Triton-Experience-System架构调研.md`
 - `doc/2026-Triton进化优化研究与实施总计划.md`
 - `doc/source_index.md`
-- `doc/genetic_operators_explained.md`
+- `doc/提示词工程与Skill系统设计方案.md`
 - `doc/learn/README.md`
 - `doc/learn/导读写作规范.md`
 
-Documents under `doc/outdated/` are historical snapshots only. They are not
-authoritative for current architecture, hardware assumptions, or implementation
-order. If a historical document conflicts with the current master plan, follow
-`doc/2026-Triton进化优化研究与实施总计划.md`.
+Read `doc/README.md` first. The Experience System report is the latest
+architecture result, but it is analysis only and does not mean Experience
+retrieval has been implemented. Old stage reports and superseded plans are kept
+outside the current documentation set in the local `supply-doc` Git history;
+they are not authoritative for current architecture, hardware assumptions, or
+implementation order.
 
-Before changing architecture, executor behavior, scoring, cache format, or
-remote Ascend workflow, read the master plan and the relevant document first.
+Before changing architecture, executor behavior, scoring, cache format,
+Experience behavior, or remote Ascend workflow, read `doc/README.md`, the master
+plan, and the relevant document first.
 
 Before adding or modifying learning guides under `doc/learn/`, read
 `doc/learn/README.md` and `doc/learn/导读写作规范.md`.
